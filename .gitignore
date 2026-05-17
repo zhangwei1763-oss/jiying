@@ -1,0 +1,28 @@
+# Local runtime data
+data/
+materials/
+outputs/
+models/
+
+# Bundled dependencies and generated packages
+dependencies/
+.pyinstaller_pkgs/
+.pyinstaller_cv_pkgs/
+
+# Build outputs
+build/
+dist/
+release/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Logs and crash reports
+*.log
+crash.log
+startup_stdout.log
+startup_stderr.log
+
+# Local backups
+*.bak*
