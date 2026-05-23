@@ -40,6 +40,9 @@ THUMB_DIR = DATA_DIR / "thumbs"
 GENERATED_IMAGE_DIR = OUTPUT_DIR / "generated_images"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 LICENSE_FILE = DATA_DIR / "license.json"
+IMAGE_PROMPT_TEMPLATES_FILE = DATA_DIR / "image_prompt_templates.json"
+REWRITE_PROMPT_TEMPLATES_FILE = DATA_DIR / "rewrite_prompt_templates.json"
+REWRITE_HISTORY_FILE = DATA_DIR / "rewrite_history.json"
 MATERIALS_FILE = DATA_DIR / "materials.json"
 TASKS_FILE = DATA_DIR / "tasks.json"
 PARSED_VIDEOS_FILE = DATA_DIR / "parsed_videos.json"
@@ -115,6 +118,40 @@ REWRITE_PROMPT_TEMPLATE = """现在我给你一段同行爆款带货对标文案
 {source}
 """
 
+DEFAULT_IMAGE_PROMPT_TEMPLATES = [
+    {
+        "name": "默认图片提示词",
+        "template": "{prompt}",
+    }
+]
+DEFAULT_REWRITE_PROMPT_TEMPLATES = [
+    {
+        "name": "Grok分镜改写",
+        "template": REWRITE_PROMPT_TEMPLATE,
+    }
+]
+IMAGE_QUALITY_OPTIONS = ("auto", "high", "medium", "low")
+IMAGE_QUALITY_LABELS = {
+    "auto": "自动",
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+}
+IMAGE_ASPECT_PRESETS = [
+    ("1:1", "2048", "2048"),
+    ("3:2", "2048", "1365"),
+    ("2:3", "1365", "2048"),
+    ("4:3", "2048", "1536"),
+    ("3:4", "1536", "2048"),
+    ("9:16", "1088", "1920"),
+    ("1:1(2k)", "2048", "2048"),
+    ("16:9(2k)", "1920", "1088"),
+    ("9:16(2k)", "1088", "1920"),
+    ("16:9(4k)", "3840", "2160"),
+    ("9:16(4k)", "2160", "3840"),
+    ("auto", "2048", "2048"),
+]
+
 
 def ensure_dirs():
     DATA_DIR.mkdir(exist_ok=True)
@@ -128,12 +165,21 @@ def add_nvidia_dll_directories():
     if os.name != "nt":
         return
     candidates = []
+    bundled_cuda = APP_DIR / "cuda_runtime"
+    candidates.extend((
+        bundled_cuda,
+        bundled_cuda / "cublas" / "bin",
+        bundled_cuda / "cudnn" / "bin",
+        bundled_cuda / "cuda_nvrtc" / "bin",
+        bundled_cuda / "cuda_runtime" / "bin",
+    ))
     for root in site.getsitepackages():
         base = Path(root) / "nvidia"
         candidates.extend((
             base / "cublas" / "bin",
             base / "cudnn" / "bin",
             base / "cuda_nvrtc" / "bin",
+            base / "cuda_runtime" / "bin",
         ))
     for path in candidates:
         if path.exists():
@@ -142,7 +188,7 @@ def add_nvidia_dll_directories():
                 os.add_dll_directory(str(path))
             except (AttributeError, OSError):
                 pass
-    for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll", "nvrtc64_120_0.dll"):
+    for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cudart64_12.dll", "cudnn64_9.dll", "nvrtc64_120_0.dll"):
         for path in candidates:
             dll_path = path / dll_name
             if dll_path.exists():
@@ -195,10 +241,82 @@ def read_json(path, default):
         return default
 
 
+JSON_LOCKS = {}
+JSON_LOCKS_GUARD = threading.Lock()
+
+
+def json_lock_for(path):
+    key = str(Path(path).resolve())
+    with JSON_LOCKS_GUARD:
+        lock = JSON_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            JSON_LOCKS[key] = lock
+        return lock
+
+
 def write_json(path, data):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
+    lock = json_lock_for(path)
+    with lock:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def repair_prompt_templates(items, defaults):
+    if not isinstance(items, list):
+        items = []
+    templates = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = text_value(item.get("name")).strip()
+        template = text_value(item.get("template")).strip()
+        if not name or not template or name in seen:
+            continue
+        templates.append({"name": name, "template": template})
+        seen.add(name)
+    for item in defaults:
+        name = item["name"]
+        if name not in seen:
+            templates.append({"name": name, "template": item["template"]})
+            seen.add(name)
+    return templates
+
+
+def apply_prompt_template(template, key, content):
+    template = text_value(template).strip()
+    content = text_value(content).strip()
+    placeholder = "{" + key + "}"
+    if not template:
+        return content
+    if placeholder in template:
+        return template.replace(placeholder, content)
+    return f"{template}\n\n{content}".strip()
+
+
+def unique_alias(base, existing_aliases, fallback="image"):
+    alias = safe_alias(base, fallback)
+    existing = {text_value(item).lower() for item in existing_aliases}
+    if alias.lower() not in existing:
+        return alias
+    root = alias
+    index = 2
+    while True:
+        candidate = safe_alias(f"{root}_{index}", f"{fallback}_{index}")
+        if candidate.lower() not in existing:
+            return candidate
+        index += 1
 
 
 def machine_fingerprint():
@@ -265,6 +383,28 @@ def data_uri_for_file(path):
     return f"data:{mime};base64,{encoded}"
 
 
+def is_image_file(path):
+    mime, _ = mimetypes.guess_type(path)
+    return bool(mime and mime.startswith("image/"))
+
+
+def read_text_attachment(path, max_chars=12000):
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix not in {".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".srt", ".py", ".js", ".ts", ".css", ".log"}:
+        return ""
+    for encoding in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+        try:
+            text = path.read_text(encoding=encoding, errors="replace")
+            break
+        except OSError:
+            return ""
+    text = text.strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n[文件内容过长，已截断]"
+    return text
+
+
 def video_size_for_aspect(aspect_ratio):
     return {
         "16:9": "1280x720",
@@ -297,6 +437,19 @@ def thumbnail_path_for(material):
 
 
 def repair_material(item):
+    if not isinstance(item, dict):
+        item = {}
+    refs = item.get("references") or []
+    if not isinstance(refs, list):
+        refs = []
+    item = {key: item.get(key) for key in ("id", "alias", "path", "added_at", "tags", "prompt", "references") if key in item}
+    item.setdefault("id", uuid.uuid4().hex[:12])
+    item.setdefault("alias", "image")
+    item.setdefault("path", "")
+    item.setdefault("added_at", now_text())
+    item.setdefault("tags", "")
+    item.setdefault("prompt", "")
+    item["references"] = [text_value(ref) for ref in refs]
     material = Material(**item)
     material.alias = safe_alias(material.alias, f"image_{material.id[:6]}")
     path = Path(material.path)
@@ -572,6 +725,14 @@ def append_image_generation_log(message):
         pass
 
 
+def append_transcribe_log(message):
+    try:
+        with open(APP_DIR / "transcribe_error.log", "a", encoding="utf-8") as file:
+            file.write(f"[{now_text()}] {message}\n")
+    except OSError:
+        pass
+
+
 def compact_log_data(value):
     if isinstance(value, dict):
         compact = {}
@@ -647,18 +808,65 @@ def multipart_form_data(fields, files):
         chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
         chunks.append(str(value).encode("utf-8"))
         chunks.append(b"\r\n")
-    for name, path in files.items():
+    if isinstance(files, dict):
+        file_items = list(files.items())
+    else:
+        file_items = list(files)
+    for item in file_items:
+        if len(item) == 2:
+            name, path = item
+            filename = Path(path).name
+        else:
+            name, path, filename = item[:3]
         path = Path(path)
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         chunks.append(f"--{boundary}\r\n".encode("utf-8"))
         chunks.append(
-            f'Content-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'.encode("utf-8")
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8")
         )
         chunks.append(f"Content-Type: {mime}\r\n\r\n".encode("utf-8"))
         chunks.append(path.read_bytes())
         chunks.append(b"\r\n")
     chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
     return boundary, b"".join(chunks)
+
+
+def http_multipart_json(url, api_key, fields, files, timeout=180, retries=0):
+    boundary, body = multipart_form_data(fields, files)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Accept": "application/json",
+        "User-Agent": "GrokVideoStudio/1.0",
+        "Connection": "close",
+    }
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+                return json.loads(text) if text else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            if attempt < retries:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            raise RuntimeError(str(exc.reason)) from exc
+        except http.client.RemoteDisconnected as exc:
+            if attempt < retries:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            raise RuntimeError("接口服务器主动断开连接，可能是模型服务繁忙或当前模型不支持该请求。") from exc
+        except (ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout) as exc:
+            if attempt < retries:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            if isinstance(exc, (TimeoutError, socket.timeout)):
+                raise RuntimeError(f"请求超时：{timeout} 秒内接口没有响应") from exc
+            raise RuntimeError(f"接口连接被中断：{exc}") from exc
+    raise RuntimeError("接口请求失败")
 
 
 def transcribe_audio_file(path, api_key, base_url, model):
@@ -699,10 +907,21 @@ def transcribe_audio_file(path, api_key, base_url, model):
 
 
 def transcribe_audio_file_local_gpu(path, settings, status_callback=None):
+    if status_callback:
+        status_callback("检查本地 GPU 转写依赖")
     try:
+        import ctranslate2
         from faster_whisper import BatchedInferencePipeline, WhisperModel
     except ImportError as exc:
         raise RuntimeError("未安装本地 GPU 文案提取依赖，请先运行 dependencies\\faster-whisper-gpu\\install_gpu_deps.bat") from exc
+    try:
+        cuda_count = int(ctranslate2.get_cuda_device_count()) if hasattr(ctranslate2, "get_cuda_device_count") else 0
+    except Exception:
+        cuda_count = 0
+    if cuda_count <= 0:
+        raise RuntimeError("未检测到可用 CUDA 设备，请检查 NVIDIA 显卡驱动，或切换到 API 转写。")
+    if status_callback:
+        status_callback(f"检测到 {cuda_count} 个 CUDA 设备")
 
     model_name = text_value(settings.get("local_whisper_model"), LOCAL_WHISPER_MODEL_NAME).strip() or LOCAL_WHISPER_MODEL_NAME
     model_dir = text_value(settings.get("local_whisper_model_dir")).strip()
@@ -723,6 +942,8 @@ def transcribe_audio_file_local_gpu(path, settings, status_callback=None):
             status_callback(f"加载本地 GPU 模型：{model_name}")
         kwargs = {"device": "cuda", "compute_type": compute_type}
         if model_dir:
+            if not Path(model_dir).exists():
+                raise RuntimeError(f"模型目录不存在：{model_dir}")
             kwargs["download_root"] = model_dir
         try:
             model = WhisperModel(model_name, **kwargs)
@@ -730,9 +951,11 @@ def transcribe_audio_file_local_gpu(path, settings, status_callback=None):
             raise RuntimeError(f"本地 GPU 模型加载失败：{exc}") from exc
         LOCAL_WHISPER_CACHE.clear()
         LOCAL_WHISPER_CACHE[cache_key] = model
+        if status_callback:
+            status_callback(f"本地 GPU 模型加载完成：{model_name}")
 
     if status_callback:
-        status_callback(f"本地 GPU 文案提取中：batch={batch_size}")
+        status_callback(f"本地 GPU 文案提取中：batch={batch_size}, beam={beam_size}")
     try:
         if batch_size > 1:
             batched_model = BatchedInferencePipeline(model=model)
@@ -750,7 +973,14 @@ def transcribe_audio_file_local_gpu(path, settings, status_callback=None):
                 vad_filter=True,
                 beam_size=beam_size,
             )
-        return "".join(segment.text for segment in segments).strip()
+        parts = []
+        for index, segment in enumerate(segments, 1):
+            parts.append(segment.text)
+            if status_callback and index % 10 == 0:
+                status_callback(f"本地 GPU 文案提取中：已识别 {index} 段")
+        if status_callback:
+            status_callback(f"本地 GPU 文案提取完成：共 {len(parts)} 段")
+        return "".join(parts).strip()
     except Exception as exc:
         raise RuntimeError(f"本地 GPU 文案提取失败：{exc}") from exc
 
@@ -867,6 +1097,68 @@ def chat_completion_messages(messages, api_key, base_url, model):
     return text_value(result.get("output_text") or result.get("text")).strip()
 
 
+def chat_completion_messages_stream(messages, api_key, base_url, model, on_delta):
+    if not api_key:
+        raise RuntimeError("缺少文本模型 API Key")
+    base_url = (base_url or "https://api.openai.com/v1").strip().rstrip("/")
+    payload = {
+        "model": model or TEXT_MODEL_NAME,
+        "messages": messages,
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "GrokVideoStudio/1.0",
+        "Connection": "close",
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(f"{base_url}/chat/completions", data=body, headers=headers, method="POST")
+    chunks = []
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            while True:
+                raw = resp.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if content is None:
+                    message = choice.get("message") or {}
+                    content = message.get("content")
+                content = text_value(content)
+                if content:
+                    chunks.append(content)
+                    on_delta(content)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(str(exc.reason)) from exc
+    except http.client.RemoteDisconnected as exc:
+        raise RuntimeError("接口服务器主动断开连接，可能是模型服务繁忙、请求内容过长或当前模型不支持流式回复。") from exc
+    except (ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout) as exc:
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            raise RuntimeError("请求超时：300 秒内接口没有响应") from exc
+        raise RuntimeError(f"接口连接被中断：{exc}") from exc
+    return "".join(chunks).strip()
+
+
 def save_image_from_result(result, prompt):
     data = result.get("data") or []
     first = data[0] if isinstance(data, list) and data else result
@@ -940,25 +1232,49 @@ def image_poll_attempts():
     return max(1, (IMAGE_POLL_TIMEOUT + IMAGE_POLL_INTERVAL - 1) // IMAGE_POLL_INTERVAL)
 
 
-def generate_image_file(prompt, api_key, base_url, model, size="1024x1024", poll_path=DEFAULT_IMAGE_POLL_PATH, status_callback=None, reference_paths=None):
+def generate_image_file(prompt, api_key, base_url, model, size="1024x1024", poll_path=DEFAULT_IMAGE_POLL_PATH, status_callback=None, reference_paths=None, quality="auto"):
     if not api_key:
         raise RuntimeError("缺少文生图 API Key")
     base_url = (base_url or "https://api.openai.com/v1").strip().rstrip("/")
-    payload = {
-        "model": model or IMAGE_MODEL_NAME,
-        "prompt": prompt,
-        "size": size,
-        "n": 1,
-        "background": "auto",
-    }
-    references = []
+    resolved_references = []
     for path in (reference_paths or [])[:MAX_REFERENCE_IMAGES]:
-        if Path(path).exists():
-            references.append({"image_url": data_uri_for_file(path)})
-    if references:
-        payload["reference_images"] = references
-        payload["input_references"] = references
-    submit_result = http_json("POST", f"{base_url}/images/generations", api_key, payload, timeout=IMAGE_SUBMIT_TIMEOUT)
+        ref_path = Path(path)
+        if ref_path.exists():
+            resolved_references.append(ref_path)
+    if resolved_references:
+        fields = {
+            "model": model or IMAGE_MODEL_NAME,
+            "prompt": prompt,
+            "size": size,
+            "n": 1,
+            "background": "auto",
+        }
+        if quality:
+            fields["quality"] = quality
+        files = [("image", path, path.name) for path in resolved_references]
+        append_image_generation_log(
+            f"submit_endpoint={base_url}/images/edits reference_count={len(files)} "
+            f"reference_files={[path.name for path in resolved_references]}"
+        )
+        submit_result = http_multipart_json(
+            f"{base_url}/images/edits",
+            api_key,
+            fields,
+            files,
+            timeout=IMAGE_SUBMIT_TIMEOUT,
+        )
+    else:
+        payload = {
+            "model": model or IMAGE_MODEL_NAME,
+            "prompt": prompt,
+            "size": size,
+            "n": 1,
+            "background": "auto",
+        }
+        if quality:
+            payload["quality"] = quality
+        append_image_generation_log(f"submit_endpoint={base_url}/images/generations reference_count=0")
+        submit_result = http_json("POST", f"{base_url}/images/generations", api_key, payload, timeout=IMAGE_SUBMIT_TIMEOUT)
     append_image_generation_log(f"submit_result={json.dumps(compact_log_data(submit_result), ensure_ascii=False)}")
     direct_path = save_image_from_result(submit_result, prompt)
     if direct_path:
@@ -1074,6 +1390,8 @@ class Material:
     path: str
     added_at: str
     tags: str = ""
+    prompt: str = ""
+    references: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1112,6 +1430,7 @@ class ImageTask:
     prompt: str
     size: str
     references: list[str]
+    quality: str = "auto"
     status: str = "queued"
     request_id: str = ""
     output_path: str = ""
@@ -1138,8 +1457,9 @@ def repair_image_task(item):
     task = ImageTask(
         id=text_value(item.get("id"), uuid.uuid4().hex[:12]),
         prompt=text_value(item.get("prompt")),
-        size=text_value(item.get("size"), "1024x1024"),
+        size=text_value(item.get("size"), "2048x2048"),
         references=[text_value(ref) for ref in refs],
+        quality=text_value(item.get("quality"), "auto"),
         status=text_value(item.get("status"), "queued"),
         request_id=text_value(item.get("request_id")),
         output_path=text_value(item.get("output_path")),
@@ -1164,7 +1484,17 @@ def repair_agent_conversation(item):
         role = text_value(message.get("role")).strip()
         content = text_value(message.get("content")).strip()
         if role in ("system", "user", "assistant") and content:
-            clean_messages.append({"role": role, "content": content})
+            clean_message = {"role": role, "content": content}
+            if "model_content" in message:
+                model_content = message.get("model_content")
+                if isinstance(model_content, str):
+                    clean_message["model_content"] = text_value(model_content)
+                elif isinstance(model_content, list):
+                    clean_message["model_content"] = model_content
+            attachments = message.get("attachments")
+            if isinstance(attachments, list):
+                clean_message["attachments"] = [item for item in attachments if isinstance(item, dict)]
+            clean_messages.append(clean_message)
     conversation_id = text_value(item.get("id"), uuid.uuid4().hex[:12])
     title = text_value(item.get("title"), "新对话")
     return AgentConversation(
@@ -1526,8 +1856,9 @@ class GrokVideoStudio:
         self.root.title(APP_NAME)
         if APP_ICON_FILE.exists():
             self.root.iconbitmap(str(APP_ICON_FILE))
-        self.root.geometry("1320x840")
-        self.root.minsize(1180, 740)
+        self.root.resizable(True, True)
+        self.root.geometry("1600x900")
+        self.root.minsize(1400, 800)
         self.setup_dark_style()
 
         self.settings = read_json(SETTINGS_FILE, {
@@ -1577,6 +1908,13 @@ class GrokVideoStudio:
         self.image_tasks = [repair_image_task(item) for item in read_json(IMAGE_TASKS_FILE, [])]
         self.persist_image_tasks()
         self.agent_conversations = [repair_agent_conversation(item) for item in read_json(AGENT_CONVERSATIONS_FILE, [])]
+        self.image_prompt_templates = repair_prompt_templates(read_json(IMAGE_PROMPT_TEMPLATES_FILE, []), DEFAULT_IMAGE_PROMPT_TEMPLATES)
+        self.rewrite_prompt_templates = repair_prompt_templates(read_json(REWRITE_PROMPT_TEMPLATES_FILE, []), DEFAULT_REWRITE_PROMPT_TEMPLATES)
+        self.rewrite_history = read_json(REWRITE_HISTORY_FILE, [])
+        if not isinstance(self.rewrite_history, list):
+            self.rewrite_history = []
+        self.persist_image_prompt_templates()
+        self.persist_rewrite_prompt_templates()
         self.current_agent_conversation_id = ""
         if not self.agent_conversations:
             self.agent_conversations.append(self.new_agent_conversation_object())
@@ -1585,6 +1923,8 @@ class GrokVideoStudio:
         self.event_queue = queue.Queue()
         self.worker_stop = threading.Event()
         self.worker_thread = None
+        self.task_checked_ids = set()
+        self.active_transcribe_jobs = {}
         self.material_images = {}
         self.asset_grid_images = {}
 
@@ -1599,18 +1939,36 @@ class GrokVideoStudio:
         self.search_var = StringVar(value="")
         self.generate_search_var = StringVar(value="")
         self.generate_asset_type_var = StringVar(value="全部")
+        self.image_search_var = StringVar(value="")
+        self.image_asset_type_var = StringVar(value="全部")
         self.parse_url_var = StringVar(value="")
         self.parser_download_dir_var = StringVar(value=self.settings.get("parser_download_dir") or str(OUTPUT_DIR / "parsed_videos"))
         self.parser_status_var = StringVar(value="待解析")
         self.asset_type_var = StringVar(value="全部")
         self.agent_input_var = StringVar(value="")
+        self.agent_attachment_var = StringVar(value="未添加附件")
+        self.agent_attachment_paths = []
         self.rewrite_input_var = StringVar(value="")
-        self.image_size_var = StringVar(value="1024x1024")
+        self.image_size_var = StringVar(value="2048x2048")
+        self.image_width_var = StringVar(value="2048")
+        self.image_height_var = StringVar(value="2048")
+        self.image_quality_var = StringVar(value="auto")
+        self.image_aspect_var = StringVar(value="1:1(2k)")
+        self.image_width_var.trace_add("write", lambda *_: self.update_image_size_from_dimensions())
+        self.image_height_var.trace_add("write", lambda *_: self.update_image_size_from_dimensions())
         self.image_status_var = StringVar(value="待生成")
+        self.image_template_var = StringVar(value=self.image_prompt_templates[0]["name"] if self.image_prompt_templates else "")
+        self.rewrite_template_var = StringVar(value=self.rewrite_prompt_templates[0]["name"] if self.rewrite_prompt_templates else "")
         self.generate_material_images = {}
         self.image_reference_paths = []
+        self.video_reference_paths = []
+        self.image_reference_images = {}
+        self.video_reference_images = {}
+        self.image_asset_images = {}
         self.image_reference_var = StringVar(value="未上传参考图")
+        self.video_reference_var = StringVar(value="未上传参考图")
         self.last_generated_image_path = ""
+        self.last_generated_image_task_id = ""
 
         self.build_ui()
         self.refresh_materials()
@@ -1637,6 +1995,12 @@ class GrokVideoStudio:
         style.map("Dark.TCombobox", fieldbackground=[("readonly", "#000000"), ("focus", "#000000"), ("!disabled", "#000000")], foreground=[("readonly", COLOR_TEXT), ("focus", COLOR_TEXT), ("!disabled", COLOR_TEXT)], selectbackground=[("readonly", "#000000"), ("focus", "#000000")], selectforeground=[("readonly", COLOR_TEXT), ("focus", COLOR_TEXT)])
         style.configure("TSpinbox", fieldbackground="#000000", background=COLOR_PANEL_2, foreground=COLOR_TEXT, selectbackground="#000000", selectforeground=COLOR_TEXT)
         style.map("TSpinbox", fieldbackground=[("readonly", "#000000"), ("focus", "#000000"), ("!disabled", "#000000")], foreground=[("readonly", COLOR_TEXT), ("focus", COLOR_TEXT), ("!disabled", COLOR_TEXT)], selectbackground=[("readonly", "#000000"), ("focus", "#000000")], selectforeground=[("readonly", COLOR_TEXT), ("focus", COLOR_TEXT)])
+        style.configure("TRadiobutton", background=COLOR_PANEL, foreground=COLOR_TEXT)
+        style.map(
+            "TRadiobutton",
+            background=[("active", COLOR_PANEL), ("selected", COLOR_PANEL), ("!disabled", COLOR_PANEL)],
+            foreground=[("active", COLOR_TEXT), ("selected", COLOR_TEXT), ("!disabled", COLOR_TEXT)],
+        )
         self.root.option_add("*TCombobox*Listbox.background", COLOR_INPUT)
         self.root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT_DARK)
@@ -1645,7 +2009,24 @@ class GrokVideoStudio:
         style.configure("Treeview.Heading", background=COLOR_PANEL_2, foreground=COLOR_MUTED, relief="flat", font=FONT_SMALL)
         style.map("Treeview", background=[("selected", COLOR_ACCENT_DARK)], foreground=[("selected", "#ffffff")])
         style.configure("Material.Treeview", rowheight=106, background=COLOR_INPUT, foreground=COLOR_TEXT, fieldbackground=COLOR_INPUT)
-        style.configure("Vertical.TScrollbar", background=COLOR_PANEL_2, troughcolor=COLOR_INPUT, bordercolor=COLOR_BORDER, arrowcolor=COLOR_TEXT)
+        scrollbar_options = {
+            "background": COLOR_PANEL_2,
+            "troughcolor": COLOR_INPUT,
+            "bordercolor": COLOR_BORDER,
+            "lightcolor": COLOR_BORDER,
+            "darkcolor": COLOR_BORDER,
+            "arrowcolor": COLOR_TEXT,
+            "relief": "flat",
+            "borderwidth": 1,
+        }
+        for scrollbar_style in ("TScrollbar", "Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(scrollbar_style, **scrollbar_options)
+            style.map(
+                scrollbar_style,
+                background=[("active", COLOR_ACCENT_DARK), ("pressed", COLOR_ACCENT_DARK), ("!disabled", COLOR_PANEL_2)],
+                troughcolor=[("!disabled", COLOR_INPUT)],
+                arrowcolor=[("active", "#ffffff"), ("pressed", "#ffffff"), ("!disabled", COLOR_TEXT)],
+            )
 
     def apply_dark_theme(self, widget):
         for child in widget.winfo_children():
@@ -1694,8 +2075,6 @@ class GrokVideoStudio:
         top.pack(fill=X)
         Label(top, text="AI 视频内容工作台", font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_TEXT).pack(side=LEFT)
         Button(top, text="配置 AI", command=self.open_ai_settings, bg=COLOR_ACCENT_DARK).pack(side=LEFT, padx=(18, 0))
-        Button(top, text="开始轮询", command=self.start_worker).pack(side=LEFT, padx=(8, 0))
-        Button(top, text="暂停轮询", command=self.stop_worker).pack(side=LEFT, padx=(8, 0))
         Button(top, text="打开输出目录", command=self.open_output_dir).pack(side=LEFT, padx=(8, 0))
         Label(top, textvariable=self.status_var, anchor="e", bg=COLOR_BG, fg=COLOR_MUTED, font=FONT_SMALL).pack(side=RIGHT)
 
@@ -1823,15 +2202,29 @@ class GrokVideoStudio:
         right.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
         chat_box = LabelFrame(right, text="智能体对话", padx=8, pady=8)
         chat_box.pack(fill=BOTH, expand=True)
-        self.agent_chat_text = Text(chat_box, wrap="word", height=20)
-        self.agent_chat_text.pack(fill=BOTH, expand=True)
+        chat_shell = Frame(chat_box)
+        chat_shell.pack(fill=BOTH, expand=True)
+        self.agent_chat_text = Text(chat_shell, wrap="word", height=20)
+        self.agent_chat_text.pack(side=LEFT, fill=BOTH, expand=True)
+        agent_chat_scrollbar = ttk.Scrollbar(chat_shell, orient="vertical", command=self.agent_chat_text.yview)
+        agent_chat_scrollbar.pack(side=RIGHT, fill=Y)
+        self.agent_chat_text.configure(yscrollcommand=agent_chat_scrollbar.set)
+        self.agent_chat_text.tag_configure("user_role", foreground=COLOR_ACCENT, font=("Microsoft YaHei UI", 10, "bold"), spacing1=8, spacing3=2)
+        self.agent_chat_text.tag_configure("assistant_role", foreground=COLOR_SUCCESS, font=("Microsoft YaHei UI", 10, "bold"), spacing1=8, spacing3=2)
+        self.agent_chat_text.tag_configure("message_body", foreground=COLOR_TEXT, lmargin1=14, lmargin2=14, spacing3=8)
         self.agent_chat_text.configure(state="disabled")
         input_row = Frame(right)
-        input_row.pack(fill=X, pady=(8, 0))
-        agent_entry = Entry(input_row, textvariable=self.agent_input_var)
-        agent_entry.pack(side=LEFT, fill=X, expand=True)
-        agent_entry.bind("<Return>", lambda _event: self.send_agent_message())
-        Button(input_row, text="发送", command=self.send_agent_message).pack(side=LEFT, padx=(8, 0))
+        input_row.pack(fill=X, pady=(10, 0), ipady=4)
+        self.agent_entry = Entry(input_row, textvariable=self.agent_input_var, font=("Microsoft YaHei UI", 11), relief="flat", bd=1)
+        self.agent_entry.pack(side=LEFT, fill=X, expand=True, ipady=8)
+        self.agent_entry.bind("<KeyPress>", self.handle_prompt_keypress)
+        self.agent_entry.bind("<KeyRelease>", self.handle_prompt_keyrelease)
+        self.agent_entry.bind("<Return>", lambda _event: self.send_agent_message())
+        self.agent_entry.bind("<Escape>", lambda _event: self.hide_material_suggestions())
+        Button(input_row, text="上传附件", command=self.choose_agent_attachments).pack(side=LEFT, padx=(8, 0), ipady=3)
+        Button(input_row, text="清空附件", command=self.clear_agent_attachments).pack(side=LEFT, padx=(8, 0), ipady=3)
+        Button(input_row, text="发送", command=self.send_agent_message).pack(side=LEFT, padx=(8, 0), ipady=3)
+        Label(right, textvariable=self.agent_attachment_var, anchor="w", fg=COLOR_MUTED).pack(fill=X, pady=(2, 0))
         self.refresh_agent_conversations()
         self.show_agent_conversation()
 
@@ -1877,8 +2270,21 @@ class GrokVideoStudio:
         self.agent_chat_text.delete("1.0", END)
         if conversation:
             for message in conversation.messages:
-                role = "用户" if message.get("role") == "user" else "智能体"
-                self.agent_chat_text.insert(END, f"{role}：\n{message.get('content', '')}\n\n")
+                if message.get("role") == "user":
+                    self.agent_chat_text.insert(END, "用户：\n", "user_role")
+                else:
+                    self.agent_chat_text.insert(END, "智能体：\n", "assistant_role")
+                content = message.get("content", "")
+                if content:
+                    self.agent_chat_text.insert(END, f"{content}\n\n", "message_body")
+        self.agent_chat_text.configure(state="disabled")
+        self.agent_chat_text.see(END)
+
+    def append_agent_stream_delta(self, conversation_id, delta):
+        if conversation_id != self.current_agent_conversation_id or not hasattr(self, "agent_chat_text"):
+            return
+        self.agent_chat_text.configure(state="normal")
+        self.agent_chat_text.insert(END, delta, "message_body")
         self.agent_chat_text.configure(state="disabled")
         self.agent_chat_text.see(END)
 
@@ -1951,19 +2357,137 @@ class GrokVideoStudio:
         Button(actions, text="保存", command=save).pack(side=RIGHT)
         Button(actions, text="取消", command=win.destroy).pack(side=RIGHT, padx=(0, 8))
 
+    def update_agent_attachment_label(self):
+        refs = self.resolve_prompt_refs(self.agent_input_var.get())
+        names = []
+        materials = self.materials_by_id()
+        for ref in refs:
+            if ref in materials:
+                names.append(f"@{materials[ref].alias}")
+        for path in self.agent_attachment_paths:
+            names.append(Path(path).name)
+        if names:
+            self.agent_attachment_var.set(f"附件 {len(names)} 个：{', '.join(names[:4])}" + (" ..." if len(names) > 4 else ""))
+        else:
+            self.agent_attachment_var.set("未添加附件")
+
+    def choose_agent_attachments(self):
+        paths = filedialog.askopenfilenames(
+            title="选择发给 Agent 的图片或文件",
+            filetypes=[
+                ("图片和文本文件", "*.png *.jpg *.jpeg *.webp *.bmp *.txt *.md *.csv *.json *.xml *.html *.htm *.srt *.py *.js *.ts *.css *.log"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        existing = list(self.agent_attachment_paths)
+        for path in paths:
+            if path not in existing:
+                existing.append(path)
+        self.agent_attachment_paths = existing[:10]
+        self.update_agent_attachment_label()
+        self.log(f"Agent 已添加附件 {len(self.agent_attachment_paths)} 个")
+
+    def clear_agent_attachments(self):
+        self.agent_attachment_paths = []
+        self.update_agent_attachment_label()
+
+    def build_agent_user_message(self, content, attachment_paths):
+        materials = self.materials_by_id()
+        refs = self.resolve_prompt_refs(content)
+        image_paths = []
+        text_blocks = []
+        display_files = []
+        attachments = []
+        for ref in refs:
+            material = materials.get(ref)
+            if material and Path(material.path).exists():
+                image_paths.append(material.path)
+                display_files.append(f"@{material.alias}")
+                attachments.append({"kind": "material", "id": material.id, "alias": material.alias})
+        for path in attachment_paths:
+            path_obj = Path(path)
+            if not path_obj.exists():
+                continue
+            display_files.append(path_obj.name)
+            if is_image_file(path_obj):
+                image_paths.append(str(path_obj))
+                attachments.append({"kind": "file", "type": "image", "path": str(path_obj), "name": path_obj.name})
+            else:
+                text = read_text_attachment(path_obj)
+                if text:
+                    text_blocks.append(f"【文件：{path_obj.name}】\n{text}")
+                    attachments.append({"kind": "file", "type": "text", "path": str(path_obj), "name": path_obj.name, "text": text})
+                else:
+                    text_blocks.append(f"【文件：{path_obj.name}】该文件不是可直接读取的文本格式，请根据文件名和用户描述判断。")
+                    attachments.append({"kind": "file", "type": "unknown", "path": str(path_obj), "name": path_obj.name})
+        final_text = content
+        if text_blocks:
+            final_text += "\n\n以下是用户上传文件内容：\n\n" + "\n\n".join(text_blocks)
+        if image_paths:
+            parts = [{"type": "text", "text": final_text or "请分析这些图片。"}]
+            for path in image_paths[:MAX_REFERENCE_IMAGES]:
+                parts.append({"type": "image_url", "image_url": {"url": data_uri_for_file(path)}})
+            model_content = parts
+        else:
+            model_content = final_text
+        display_content = content
+        if display_files:
+            display_content += "\n\n[附件：" + "，".join(display_files[:8]) + (" ..." if len(display_files) > 8 else "") + "]"
+        return display_content, model_content, attachments
+
+    def restore_agent_model_content(self, content, attachments):
+        if not attachments:
+            return content
+        materials = self.materials_by_id()
+        image_paths = []
+        text_blocks = []
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") == "material":
+                material = materials.get(text_value(item.get("id")))
+                if material and Path(material.path).exists():
+                    image_paths.append(material.path)
+            elif item.get("type") == "image":
+                path = Path(text_value(item.get("path")))
+                if path.exists():
+                    image_paths.append(str(path))
+            elif item.get("type") == "text":
+                name = text_value(item.get("name")) or Path(text_value(item.get("path"))).name
+                text = text_value(item.get("text"))
+                if not text:
+                    text = read_text_attachment(text_value(item.get("path")))
+                if text:
+                    text_blocks.append(f"【文件：{name}】\n{text}")
+        final_text = content
+        if text_blocks:
+            final_text += "\n\n以下是用户上传文件内容：\n\n" + "\n\n".join(text_blocks)
+        if image_paths:
+            parts = [{"type": "text", "text": final_text or "请分析这些图片。"}]
+            for path in image_paths[:MAX_REFERENCE_IMAGES]:
+                parts.append({"type": "image_url", "image_url": {"url": data_uri_for_file(path)}})
+            return parts
+        return final_text
+
     def send_agent_message(self):
         content = self.agent_input_var.get().strip()
-        if not content:
+        if not content and not self.agent_attachment_paths:
             return
+        attachment_paths = list(self.agent_attachment_paths)
+        display_content, model_content, attachments = self.build_agent_user_message(content, attachment_paths)
         conversation = self.current_agent_conversation()
         if not conversation:
             self.create_agent_conversation()
             conversation = self.current_agent_conversation()
         if conversation.title == "新对话":
-            conversation.title = compact_text(content, 18)
-        conversation.messages.append({"role": "user", "content": content})
+            conversation.title = compact_text(content or "附件分析", 18)
+        conversation.messages.append({"role": "user", "content": display_content, "model_content": model_content, "attachments": attachments})
         conversation.updated_at = now_text()
         self.agent_input_var.set("")
+        self.agent_attachment_paths = []
+        self.update_agent_attachment_label()
         self.persist_agent_conversations()
         self.refresh_agent_conversations()
         self.show_agent_conversation()
@@ -1980,21 +2504,48 @@ class GrokVideoStudio:
                     "role": "system",
                     "content": "你是极影AI工作台内置的智能体助手。你需要记住当前会话上下文，帮助用户完成短视频文案、图片提示词、Grok视频提示词、素材管理和软件使用问题。回答要简洁、可执行。",
                 }
-            ] + conversation.messages[-20:]
-            result = chat_completion_messages(
-                messages,
-                text_value(self.settings.get("text_api_key")).strip(),
-                text_value(self.settings.get("text_base_url") or "https://api.openai.com/v1"),
-                "gpt-5.5",
-            )
-            if not result:
-                raise RuntimeError("智能体没有返回内容")
-            conversation.messages.append({"role": "assistant", "content": result})
+            ]
+            for message in conversation.messages[-20:]:
+                model_content = message.get("model_content")
+                if model_content is None:
+                    model_content = self.restore_agent_model_content(message.get("content", ""), message.get("attachments") or [])
+                messages.append({"role": message.get("role", "user"), "content": model_content})
+            assistant_message = {"role": "assistant", "content": ""}
+            conversation.messages.append(assistant_message)
             conversation.updated_at = now_text()
             self.persist_agent_conversations()
             self.event_queue.put(("agent_response", conversation_id))
+
+            def on_delta(delta):
+                assistant_message["content"] += delta
+                conversation.updated_at = now_text()
+                self.event_queue.put(("agent_stream_delta", (conversation_id, delta)))
+
+            api_key = text_value(self.settings.get("text_api_key")).strip()
+            base_url = text_value(self.settings.get("text_base_url") or "https://api.openai.com/v1")
+            try:
+                result = chat_completion_messages_stream(messages, api_key, base_url, "gpt-5.5", on_delta)
+            except Exception as stream_exc:
+                if assistant_message["content"].strip():
+                    raise
+                self.event_queue.put(("log", f"Agent 流式回复失败，已自动切换普通回复：{stream_exc}"))
+                result = chat_completion_messages(messages, api_key, base_url, "gpt-5.5")
+                if result:
+                    assistant_message["content"] = result
+                    self.event_queue.put(("agent_stream_delta", (conversation_id, result)))
+            if not result:
+                raise RuntimeError("智能体没有返回内容")
+            assistant_message["content"] = result
+            conversation.updated_at = now_text()
+            self.persist_agent_conversations()
+            self.event_queue.put(("agent_stream_done", conversation_id))
             self.event_queue.put(("log", f"Agent 已回复：{conversation_id}"))
         except Exception as exc:
+            if conversation.messages and conversation.messages[-1].get("role") == "assistant" and not conversation.messages[-1].get("content"):
+                conversation.messages[-1]["content"] = f"回复失败：{exc}"
+                conversation.updated_at = now_text()
+                self.persist_agent_conversations()
+                self.event_queue.put(("agent_response", conversation_id))
             self.event_queue.put(("log", f"Agent 对话失败：{exc}"))
 
     def build_parser_tab(self, parent):
@@ -2018,9 +2569,10 @@ class GrokVideoStudio:
         Button(action_row, text="加入素材库", command=self.add_selected_parsed_to_materials).pack(side=LEFT, padx=6)
         Button(action_row, text="文案填入改写页", command=self.use_selected_parsed_caption).pack(side=LEFT)
 
-        columns = ("title", "caption", "video", "local", "updated")
+        columns = ("index", "title", "caption", "video", "local", "updated")
         self.parsed_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse", height=10)
         for key, title, width in (
+            ("index", "序号", 56),
             ("title", "标题/平台文案", 220),
             ("caption", "音频文案/提取文案", 260),
             ("video", "视频地址", 260),
@@ -2028,7 +2580,7 @@ class GrokVideoStudio:
             ("updated", "时间", 140),
         ):
             self.parsed_tree.heading(key, text=title)
-            self.parsed_tree.column(key, width=width)
+            self.parsed_tree.column(key, width=width, anchor="center" if key == "index" else "w")
         self.parsed_tree.pack(fill=BOTH, expand=True, pady=(8, 0))
         self.parsed_tree.bind("<<TreeviewSelect>>", lambda _event: self.show_selected_parsed_detail())
         self.parsed_tree.bind("<Button-3>", self.show_parsed_context_menu)
@@ -2052,6 +2604,13 @@ class GrokVideoStudio:
         self.prompt_text.bind("<KeyRelease>", self.handle_prompt_keyrelease)
         self.prompt_text.bind("<Button-1>", lambda _event: self.hide_material_suggestions())
         self.prompt_text.bind("<Escape>", lambda _event: self.hide_material_suggestions())
+
+        ref_row = Frame(create_box)
+        ref_row.pack(fill=X, pady=(0, 8))
+        Button(ref_row, text="上传参考图", command=self.choose_video_references).pack(side=LEFT)
+        Label(ref_row, textvariable=self.video_reference_var, anchor="w", fg=COLOR_MUTED).pack(side=LEFT, padx=(8, 0), fill=X, expand=True)
+        self.video_reference_frame = Frame(create_box)
+        self.video_reference_frame.pack(fill=X, pady=(0, 8))
 
         row = Frame(create_box)
         row.pack(fill=X, pady=2)
@@ -2113,7 +2672,11 @@ class GrokVideoStudio:
         middle = Frame(top, width=130, padx=8)
         middle.pack(side=LEFT, fill=Y)
         middle.pack_propagate(False)
-        Button(middle, text="改写文案", command=self.rewrite_copy_async).pack(fill=X, pady=(20, 8))
+        Button(middle, text="自定义模板", command=lambda: self.open_prompt_template_manager("rewrite")).pack(fill=X, pady=(20, 6))
+        self.rewrite_template_combo = ttk.Combobox(middle, textvariable=self.rewrite_template_var, values=self.prompt_template_names("rewrite"), width=14, state="readonly", style="Dark.TCombobox")
+        self.rewrite_template_combo.pack(fill=X, pady=(0, 12))
+        Button(middle, text="历史记录", command=self.show_rewrite_history).pack(fill=X, pady=(0, 12))
+        Button(middle, text="改写文案", command=self.rewrite_copy_async).pack(fill=X, pady=(8, 8))
         Button(middle, text="填入生成页", command=self.use_rewrite_output).pack(fill=X)
 
         right = LabelFrame(top, text="改写结果", padx=8, pady=8)
@@ -2122,53 +2685,125 @@ class GrokVideoStudio:
         self.rewrite_output_text.pack(fill=BOTH, expand=True)
 
     def build_image_tab(self, parent):
-        left = Frame(parent, width=390)
+        left = Frame(parent, width=400)
         left.pack(side=LEFT, fill=Y)
         left.pack_propagate(False)
         prompt_box = LabelFrame(left, text="图片提示词", padx=10, pady=10)
         prompt_box.pack(fill=BOTH, expand=True)
-        self.image_prompt_text = Text(prompt_box, height=18, wrap="word")
+        template_row = Frame(prompt_box)
+        template_row.pack(fill=X, pady=(0, 8))
+        Button(template_row, text="自定义图片提示词模板", command=lambda: self.open_prompt_template_manager("image")).pack(side=LEFT)
+        self.image_template_combo = ttk.Combobox(template_row, textvariable=self.image_template_var, values=self.prompt_template_names("image"), width=18, state="readonly", style="Dark.TCombobox")
+        self.image_template_combo.pack(side=LEFT, padx=(8, 0), fill=X, expand=True)
+        self.image_template_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_selected_image_template())
+        self.image_prompt_text = Text(prompt_box, height=10, wrap="word")
         self.image_prompt_text.pack(fill=BOTH, expand=True)
+        self.image_prompt_text.bind("<KeyPress>", self.handle_prompt_keypress)
+        self.image_prompt_text.bind("<KeyRelease>", self.handle_prompt_keyrelease)
+        self.image_prompt_text.bind("<Button-1>", lambda _event: self.hide_material_suggestions())
+        self.image_prompt_text.bind("<Escape>", lambda _event: self.hide_material_suggestions())
+        param_box = LabelFrame(prompt_box, text="图片参数", padx=8, pady=8)
+        param_box.pack(fill=X, pady=(8, 0))
+        quality_row = Frame(param_box)
+        quality_row.pack(fill=X)
+        Label(quality_row, text="质量", width=8, anchor="w").pack(side=LEFT)
+        for value in IMAGE_QUALITY_OPTIONS:
+            ttk.Radiobutton(
+                quality_row,
+                text=IMAGE_QUALITY_LABELS.get(value, value),
+                value=value,
+                variable=self.image_quality_var,
+            ).pack(side=LEFT, padx=(0, 8))
+
+        size_row = Frame(param_box)
+        size_row.pack(fill=X, pady=(8, 0))
+        Label(size_row, text="尺寸", width=8, anchor="w").pack(side=LEFT)
+        Label(size_row, text="W").pack(side=LEFT)
+        Entry(size_row, textvariable=self.image_width_var, width=8).pack(side=LEFT, padx=(4, 10))
+        Label(size_row, text="H").pack(side=LEFT)
+        Entry(size_row, textvariable=self.image_height_var, width=8).pack(side=LEFT, padx=(4, 10))
+        Label(size_row, textvariable=self.image_size_var, fg=COLOR_MUTED).pack(side=LEFT)
+
+        aspect_box = LabelFrame(param_box, text="宽高比", padx=4, pady=4)
+        aspect_box.pack(fill=X, pady=(8, 0))
+        for index, (label, width, height) in enumerate(IMAGE_ASPECT_PRESETS):
+            button = Button(
+                aspect_box,
+                text=label,
+                width=9,
+                command=lambda lbl=label, w=width, h=height: self.set_image_aspect_size(lbl, w, h),
+            )
+            button.grid(row=index // 3, column=index % 3, padx=3, pady=3, sticky="ew")
+        for column in range(3):
+            aspect_box.grid_columnconfigure(column, weight=1)
+
         row = Frame(prompt_box)
         row.pack(fill=X, pady=(8, 0))
-        Label(row, text="尺寸").pack(side=LEFT)
-        ttk.Combobox(row, textvariable=self.image_size_var, values=["1024x1024", "1024x1536", "1536x1024"], width=12, state="readonly", style="Dark.TCombobox").pack(side=LEFT, padx=8)
         Button(row, text="上传参考图", command=self.choose_image_references).pack(side=LEFT)
-        Button(row, text="加入任务并生成", command=self.generate_image_async).pack(side=LEFT)
+        Button(row, text="加入任务并生成", command=self.generate_image_async).pack(side=LEFT, padx=(8, 0))
         Label(row, textvariable=self.image_status_var).pack(side=RIGHT)
 
         Label(prompt_box, textvariable=self.image_reference_var, anchor="w", fg=COLOR_MUTED).pack(fill=X, pady=(8, 0))
+        self.image_reference_frame = Frame(prompt_box)
+        self.image_reference_frame.pack(fill=X, pady=(6, 0))
 
-        middle = Frame(parent, width=470)
-        middle.pack(side=LEFT, fill=BOTH, padx=(10, 0))
-        middle.pack_propagate(False)
-        task_box = LabelFrame(middle, text="图片任务队列", padx=10, pady=10)
-        task_box.pack(fill=BOTH, expand=True)
+        middle = LabelFrame(parent, text="资产引用", padx=8, pady=8)
+        middle.pack(side=LEFT, fill=BOTH, expand=True, padx=(10, 0))
+        filter_row = Frame(middle)
+        filter_row.pack(fill=X)
+        Label(filter_row, text="分类").pack(side=LEFT, padx=(0, 4))
+        self.image_asset_type_combo = ttk.Combobox(filter_row, textvariable=self.image_asset_type_var, values=self.group_filter_values(), width=10, state="readonly", style="Dark.TCombobox")
+        self.image_asset_type_combo.pack(side=LEFT)
+        self.image_asset_type_var.trace_add("write", lambda *_: self.refresh_materials())
+        Entry(middle, textvariable=self.image_search_var).pack(fill=X, pady=(8, 4))
+        self.image_search_var.trace_add("write", lambda *_: self.refresh_materials())
+        grid_shell = Frame(middle)
+        grid_shell.pack(fill=BOTH, expand=True)
+        self.image_asset_canvas = Canvas(grid_shell, highlightthickness=0)
+        self.image_asset_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        image_asset_scrollbar = ttk.Scrollbar(grid_shell, orient="vertical", command=self.image_asset_canvas.yview)
+        image_asset_scrollbar.pack(side=RIGHT, fill=Y)
+        self.image_asset_canvas.configure(yscrollcommand=image_asset_scrollbar.set)
+        self.image_asset_grid = Frame(self.image_asset_canvas)
+        self.image_asset_window = self.image_asset_canvas.create_window((0, 0), window=self.image_asset_grid, anchor="nw")
+        self.image_asset_grid.bind(
+            "<Configure>",
+            lambda _event: self.image_asset_canvas.configure(scrollregion=self.image_asset_canvas.bbox("all")),
+        )
+        self.image_asset_refresh_after = None
+        self.image_asset_last_columns = 0
+        self.image_asset_canvas.bind("<Configure>", self.on_image_asset_canvas_configure)
+        self.image_selected_material_ids = set()
+
+        task_box = LabelFrame(parent, text="图片任务队列", padx=10, pady=10, width=420)
+        task_box.pack(side=RIGHT, fill=BOTH, expand=False, padx=(10, 0))
+        task_box.pack_propagate(False)
         columns = ("status", "prompt", "refs", "job", "output", "updated")
-        self.image_task_tree = ttk.Treeview(task_box, columns=columns, show="headings", selectmode="browse", height=16)
+        task_tree_shell = Frame(task_box)
+        task_tree_shell.pack(fill=BOTH, expand=True)
+        self.image_task_tree = ttk.Treeview(task_tree_shell, columns=columns, show="headings", selectmode="browse", height=16)
         for key, title, width in (
-            ("status", "状态", 72),
-            ("prompt", "提示词", 170),
-            ("refs", "参考图", 58),
-            ("job", "任务ID", 110),
-            ("output", "结果", 120),
-            ("updated", "更新时间", 130),
+            ("status", "状态", 78),
+            ("prompt", "提示词", 190),
+            ("refs", "参考图", 60),
+            ("job", "任务ID", 120),
+            ("output", "结果", 140),
+            ("updated", "更新时间", 140),
         ):
             self.image_task_tree.heading(key, text=title)
-            self.image_task_tree.column(key, width=width, anchor="center" if key in ("status", "refs") else "w")
-        self.image_task_tree.pack(fill=BOTH, expand=True)
+            self.image_task_tree.column(key, width=width, minwidth=width, stretch=False, anchor="center" if key in ("status", "refs") else "w")
+        self.image_task_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        image_task_y_scrollbar = ttk.Scrollbar(task_tree_shell, orient="vertical", command=self.image_task_tree.yview)
+        image_task_y_scrollbar.pack(side=RIGHT, fill=Y)
+        image_task_x_scrollbar = ttk.Scrollbar(task_box, orient="horizontal", command=self.image_task_tree.xview)
+        image_task_x_scrollbar.pack(fill=X)
+        self.image_task_tree.configure(yscrollcommand=image_task_y_scrollbar.set, xscrollcommand=image_task_x_scrollbar.set)
         self.image_task_tree.bind("<<TreeviewSelect>>", lambda _event: self.show_selected_image_task())
-        self.image_task_tree.bind("<Double-Button-1>", self.open_image_task_from_event)
+        self.image_task_tree.bind("<Double-Button-1>", self.reuse_image_task_from_event)
         self.image_task_tree.bind("<Button-3>", self.show_image_task_context_menu)
 
-        right = LabelFrame(parent, text="生成结果", padx=10, pady=10)
-        right.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
-        self.generated_image_label = Label(right, text="生成后的图片会显示在这里", anchor="center")
-        self.generated_image_label.pack(fill=BOTH, expand=True)
-        action_row = Frame(right)
-        action_row.pack(fill=X, pady=(8, 0))
-        self.add_generated_image_button = Button(action_row, text="加入资产库", command=self.add_generated_image_to_materials)
-        self.add_generated_image_button.pack(side=LEFT)
+        self.generated_image_label = None
+        self.add_generated_image_button = None
 
     def build_assets_tab(self, parent):
         toolbar = Frame(parent)
@@ -2232,15 +2867,20 @@ class GrokVideoStudio:
     def build_tasks_tab(self, parent):
         task_actions = Frame(parent)
         task_actions.pack(fill=X)
-        Button(task_actions, text="提交队列", command=self.queue_all_pending).pack(side=LEFT)
+        Button(task_actions, text="全选", command=self.toggle_all_video_tasks).pack(side=LEFT)
+        Button(task_actions, text="开始任务", command=self.start_checked_or_selected_tasks).pack(side=LEFT, padx=6)
+        Button(task_actions, text="暂停任务", command=self.pause_checked_or_selected_tasks).pack(side=LEFT)
+        Button(task_actions, text="删除任务", command=self.delete_selected_tasks).pack(side=LEFT, padx=6)
+        Button(task_actions, text="提交队列", command=self.queue_all_pending).pack(side=LEFT, padx=(12, 0))
         Button(task_actions, text="重试失败", command=self.retry_failed).pack(side=LEFT, padx=6)
         Button(task_actions, text="批量保存已完成视频", command=self.save_done_videos).pack(side=LEFT)
         Button(task_actions, text="复用选中任务", command=self.reuse_selected_task).pack(side=LEFT, padx=6)
-        Button(task_actions, text="删除选中任务", command=self.delete_selected_tasks).pack(side=LEFT, padx=6)
 
-        columns = ("status", "prompt", "params", "refs", "request", "output", "updated")
+        columns = ("index", "checked", "status", "prompt", "params", "refs", "request", "output", "updated")
         self.task_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="extended")
         for key, title, width in (
+            ("index", "序号", 56),
+            ("checked", "选择", 58),
             ("status", "状态", 88),
             ("prompt", "提示词", 360),
             ("params", "参数", 120),
@@ -2250,8 +2890,9 @@ class GrokVideoStudio:
             ("updated", "更新时间", 140),
         ):
             self.task_tree.heading(key, text=title)
-            self.task_tree.column(key, width=width, anchor="center" if key in ("status", "params", "refs", "updated") else "w")
+            self.task_tree.column(key, width=width, anchor="center" if key in ("index", "checked", "status", "params", "refs", "updated") else "w")
         self.task_tree.pack(fill=BOTH, expand=True, pady=(8, 0))
+        self.task_tree.bind("<Button-1>", self.handle_task_tree_click)
         self.task_tree.bind("<Double-Button-1>", lambda _event: self.reuse_selected_task())
         self.task_tree.bind("<Button-3>", self.show_task_context_menu)
 
@@ -2599,8 +3240,9 @@ class GrokVideoStudio:
             return
         for item_id in self.parsed_tree.get_children():
             self.parsed_tree.delete(item_id)
-        for item in self.parsed_videos:
+        for index, item in enumerate(self.parsed_videos, 1):
             self.parsed_tree.insert("", END, iid=item.id, values=(
+                index,
                 compact_text(item.title, 80),
                 compact_text(item.caption, 100),
                 compact_text(item.video_url, 100),
@@ -2751,7 +3393,7 @@ class GrokVideoStudio:
         except Exception as exc:
             messagebox.showerror("加入素材库失败", f"封面下载失败：{exc}")
             return
-        alias = safe_alias(item.title or f"cover_{material_id[:6]}", f"cover_{material_id[:6]}")
+        alias = unique_alias(item.title or f"cover_{material_id[:6]}", [material.alias for material in self.materials], f"cover_{material_id[:6]}")
         self.materials.append(Material(id=material_id, alias=alias, path=str(dest), added_at=now_text(), tags="视频封面"))
         self.persist_materials()
         self.refresh_materials()
@@ -2776,6 +3418,9 @@ class GrokVideoStudio:
         if not item:
             messagebox.showinfo("音频转文案", "请先选择一条解析记录。")
             return
+        if item.local_path and not Path(item.local_path).exists():
+            messagebox.showwarning("音频转文案", f"本地视频文件不存在：{item.local_path}")
+            return
         mode = text_value(self.settings.get("transcribe_mode"), "local_gpu").strip() or "local_gpu"
         audio_key = text_value(self.settings.get("audio_api_key") or self.settings.get("ocr_api_key")).strip()
         if mode != "local_gpu" and not audio_key:
@@ -2784,11 +3429,29 @@ class GrokVideoStudio:
                 "请先在“配置 AI”里填写音频转文案 API Key 和模型。默认接口使用兼容 OpenAI 的 /audio/transcriptions。",
             )
             return
-        self.parser_status_var.set("音频转文案中")
+        self.parser_status_var.set("准备音频转文案")
         self.save_settings()
-        self.log(f"开始提取解析视频文案：{item.id}，方式：{mode}")
+        local_text = item.local_path if item.local_path else "未下载，将尝试使用解析记录的视频地址下载"
+        self.log(f"开始提取解析视频文案：{item.id}，方式：{mode}，本地文件：{local_text}")
+        self.active_transcribe_jobs[item.id] = time.time()
         thread = threading.Thread(target=self.transcribe_parsed_video_worker, args=(item.id,), daemon=True)
         thread.start()
+        self.root.after(60000, lambda item_id=item.id: self.check_transcribe_stall(item_id, 1))
+
+    def check_transcribe_stall(self, item_id, minutes):
+        started_at = self.active_transcribe_jobs.get(item_id)
+        if not started_at:
+            return
+        elapsed = int(time.time() - started_at)
+        self.parser_status_var.set(f"音频转文案仍在运行：{elapsed} 秒")
+        self.log(
+            f"音频转文案仍在运行：{item_id}，已耗时 {elapsed} 秒；如果长时间无结果，请检查 CUDA/显卡驱动/模型目录，详情看 transcribe_error.log"
+        )
+        if minutes < 10:
+            self.root.after(60000, lambda item_id=item_id, minutes=minutes + 1: self.check_transcribe_stall(item_id, minutes))
+        else:
+            self.parser_status_var.set("音频转文案超时，请检查本地 GPU 环境")
+            self.log(f"音频转文案可能卡死：{item_id}，已超过 {elapsed} 秒。可切换 API 转写或降低模型/Batch Size。")
 
     def transcribe_parsed_video_worker(self, item_id):
         try:
@@ -2797,7 +3460,8 @@ class GrokVideoStudio:
                 raise RuntimeError("解析记录不存在")
             if not item.local_path or not Path(item.local_path).exists():
                 if not item.video_url:
-                    raise RuntimeError("该解析记录没有可下载的视频地址")
+                    raise RuntimeError("该解析记录没有本地视频文件。请先解析并下载视频，提取文案不需要填写视频链接输入框。")
+                self.event_queue.put(("parser_status", "本地视频不存在，正在从解析记录下载视频"))
                 target = self.parser_download_dir()
                 target.mkdir(parents=True, exist_ok=True)
                 filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{item.id}_{safe_name(item.title or 'parsed_video')}.mp4"
@@ -2809,6 +3473,7 @@ class GrokVideoStudio:
                 self.event_queue.put(("refresh_parsed", None))
 
             mode = text_value(self.settings.get("transcribe_mode"), "local_gpu").strip() or "local_gpu"
+            self.event_queue.put(("parser_status", f"开始转写本地视频：{Path(item.local_path).name}"))
             if mode == "local_gpu":
                 text = transcribe_audio_file_local_gpu(
                     item.local_path,
@@ -2832,14 +3497,30 @@ class GrokVideoStudio:
             self.event_queue.put(("parser_status", "音频文案已提取"))
             self.event_queue.put(("log", f"音频文案已提取：{item.id}"))
         except Exception as exc:
+            append_transcribe_log(f"item_id={item_id}\n{traceback.format_exc()}")
             self.event_queue.put(("parser_status", "音频转文案失败"))
             self.event_queue.put(("log", f"音频转文案失败：{exc}"))
+        finally:
+            self.active_transcribe_jobs.pop(item_id, None)
 
     def open_output_dir(self):
         path = self.output_dir_var.get().strip() or self.settings.get("output_dir") or str(OUTPUT_DIR)
         Path(path).mkdir(parents=True, exist_ok=True)
         self.log(f"打开输出目录：{path}")
         os.startfile(path)
+
+    def open_local_image(self, path):
+        path = Path(text_value(path))
+        if not path.exists():
+            messagebox.showinfo("打开图片", "本地图片文件不存在。")
+            return
+        self.log(f"打开本地图片：{path}")
+        os.startfile(path)
+
+    def open_material_image(self, material_id):
+        material = self.materials_by_id().get(material_id)
+        if material:
+            self.open_local_image(material.path)
 
     def add_materials(self):
         paths = filedialog.askopenfilenames(
@@ -2851,7 +3532,7 @@ class GrokVideoStudio:
         for source in paths:
             src = Path(source)
             material_id = uuid.uuid4().hex[:12]
-            alias = safe_alias(src.stem, f"image_{material_id[:6]}")
+            alias = unique_alias(src.stem, [material.alias for material in self.materials], f"image_{material_id[:6]}")
             dest = MATERIAL_DIR / f"{material_id}_{safe_name(src.name)}"
             shutil.copy2(src, dest)
             self.materials.append(Material(id=material_id, alias=alias, path=str(dest), added_at=now_text()))
@@ -2859,12 +3540,29 @@ class GrokVideoStudio:
         self.refresh_materials()
         self.log(f"已上传 {len(paths)} 张图片到素材库")
 
+    def material_prompt_widget(self):
+        focus = self.root.focus_get()
+        for name in ("prompt_text", "image_prompt_text", "agent_entry"):
+            widget = getattr(self, name, None)
+            if widget is not None and focus == widget:
+                return widget
+        return getattr(self, "prompt_text", None)
+
     def material_alias_token_at_cursor(self):
-        if not hasattr(self, "prompt_text"):
+        widget = self.material_prompt_widget()
+        if widget is None:
             return None
-        insert_index = self.prompt_text.index("insert")
+        if widget.winfo_class() == "Entry":
+            insert_index = widget.index("insert")
+            before_cursor = widget.get()[:insert_index]
+            match = re.search(r"@([\w\-\u4e00-\u9fff]*)$", before_cursor)
+            if not match:
+                return None
+            start_index = insert_index - len(match.group(0))
+            return start_index, insert_index, match.group(1).lower()
+        insert_index = widget.index("insert")
         line_start = f"{insert_index.split('.')[0]}.0"
-        before_cursor = self.prompt_text.get(line_start, insert_index)
+        before_cursor = widget.get(line_start, insert_index)
         match = re.search(r"@([\w\-\u4e00-\u9fff]*)$", before_cursor)
         if not match:
             return None
@@ -2920,6 +3618,10 @@ class GrokVideoStudio:
         if not candidates:
             self.hide_material_suggestions()
             return
+        widget = self.material_prompt_widget()
+        if widget is None:
+            return
+        self.material_suggest_widget = widget
         if self.material_suggest_popup is None or not self.material_suggest_popup.winfo_exists():
             popup = Toplevel(self.root)
             popup.overrideredirect(True)
@@ -2957,11 +3659,14 @@ class GrokVideoStudio:
         listbox.selection_clear(0, END)
         listbox.selection_set(0)
         listbox.activate(0)
-        bbox = self.prompt_text.bbox("insert")
+        bbox = widget.bbox("insert")
         if bbox:
-            x, y, _width, height = bbox
-            root_x = self.prompt_text.winfo_rootx() + x
-            root_y = self.prompt_text.winfo_rooty() + y + height + 2
+            if widget.winfo_class() == "Entry":
+                x, y, width, height = bbox
+            else:
+                x, y, width, height = bbox
+            root_x = widget.winfo_rootx() + x
+            root_y = widget.winfo_rooty() + y + height + 2
             self.material_suggest_popup.geometry(f"420x{min(8, len(candidates)) * 28}+{root_x}+{root_y}")
             self.material_suggest_popup.deiconify()
             self.material_suggest_popup.lift()
@@ -2976,10 +3681,13 @@ class GrokVideoStudio:
         material = self.materials_by_id().get(self.material_suggest_ids[index])
         if not material:
             return
-        end_index = self.prompt_text.index("insert")
+        widget = getattr(self, "material_suggest_widget", None) or self.material_prompt_widget()
+        if widget is None:
+            return
+        end_index = widget.index("insert")
         start_index = self.material_suggest_start_index or end_index
-        self.prompt_text.delete(start_index, end_index)
-        self.prompt_text.insert(start_index, f"@{material.alias} ")
+        widget.delete(start_index, end_index)
+        widget.insert(start_index, f"@{material.alias} ")
         self.hide_material_suggestions()
         self.log(f"已插入素材引用：@{material.alias}")
 
@@ -2993,6 +3701,8 @@ class GrokVideoStudio:
             return list(self.asset_selected_material_ids)
         if getattr(self, "current_section", "") == "generate" and hasattr(self, "generate_selected_material_ids"):
             return list(self.generate_selected_material_ids)
+        if getattr(self, "current_section", "") == "image" and hasattr(self, "image_selected_material_ids"):
+            return list(self.image_selected_material_ids)
         trees = []
         if getattr(self, "current_section", "") == "assets" and hasattr(self, "material_tree"):
             trees.append(self.material_tree)
@@ -3046,13 +3756,16 @@ class GrokVideoStudio:
             self.asset_type_var.get() if hasattr(self, "asset_type_var") else "全部",
         )
         self.refresh_generate_asset_grid()
+        self.refresh_image_asset_grid()
+        self.refresh_reference_strip("image")
+        self.refresh_reference_strip("video")
 
     def group_filter_values(self):
         return ["全部"] + list(self.material_groups)
 
     def update_group_combos(self):
         values = self.group_filter_values()
-        for name in ("asset_type_combo", "generate_asset_type_combo"):
+        for name in ("asset_type_combo", "generate_asset_type_combo", "image_asset_type_combo"):
             combo = getattr(self, name, None)
             if combo is not None:
                 combo.configure(values=values)
@@ -3060,6 +3773,8 @@ class GrokVideoStudio:
             self.asset_type_var.set("全部")
         if hasattr(self, "generate_asset_type_var") and self.generate_asset_type_var.get() not in values:
             self.generate_asset_type_var.set("全部")
+        if hasattr(self, "image_asset_type_var") and self.image_asset_type_var.get() not in values:
+            self.image_asset_type_var.set("全部")
 
     def refresh_asset_grid(self):
         if not hasattr(self, "asset_grid"):
@@ -3108,7 +3823,7 @@ class GrokVideoStudio:
                 tile.configure(bg="#0c4a6e", highlightbackground=COLOR_ACCENT)
                 image_label.configure(bg="#0c4a6e", fg="#ffffff")
                 name_label.configure(bg="#0c4a6e", fg="#ffffff")
-                tag_label.configure(bg="#0c4a6e", fg="#c7e8ff")
+                tag_label.configure(bg="#c7e8ff", fg="#0c4a6e")
             else:
                 tile.configure(bg=COLOR_CARD, highlightbackground=COLOR_BORDER)
                 image_label.configure(bg=COLOR_CARD, fg=COLOR_TEXT)
@@ -3132,8 +3847,13 @@ class GrokVideoStudio:
 
     def show_asset_context_menu(self, event, material_id):
         self.asset_selected_material_ids = {material_id}
-        self.refresh_asset_grid()
+        if hasattr(self, "image_selected_material_ids"):
+            self.image_selected_material_ids = {material_id}
         menu = Menu(self.root, tearoff=0)
+        menu.add_command(label="查看原图", command=lambda mid=material_id: self.open_material_image(mid))
+        menu.add_separator()
+        menu.add_command(label="复用提示词和参考图", command=lambda mid=material_id: self.reuse_material_for_image(mid))
+        menu.add_separator()
         menu.add_command(label="重命名 / 选择分组", command=self.edit_selected_material)
         menu.add_separator()
         menu.add_command(label="删除图片资源", command=self.delete_selected_materials)
@@ -3141,6 +3861,24 @@ class GrokVideoStudio:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def reuse_material_for_image(self, material_id):
+        material = self.materials_by_id().get(material_id)
+        if not material:
+            return
+        if material.prompt:
+            self.image_prompt_text.delete("1.0", END)
+            self.image_prompt_text.insert("1.0", material.prompt)
+        refs = list(material.references or [])
+        if material.id not in refs:
+            refs.insert(0, material.id)
+        self.set_image_references(refs)
+        self.show_section("image")
+        self.image_status_var.set("已复用素材参考图")
+        if material.prompt:
+            self.log(f"已复用素材提示词和参考图：@{material.alias}")
+        else:
+            self.log(f"已复用素材作为图片参考图：@{material.alias}")
 
     def refresh_generate_asset_grid(self):
         if not hasattr(self, "generate_asset_grid"):
@@ -3198,6 +3936,91 @@ class GrokVideoStudio:
             self.prompt_text.insert("insert", f" @{material.alias} ")
             self.log(f"已双击插入素材引用：@{material.alias}")
 
+    def on_image_asset_canvas_configure(self, event):
+        self.image_asset_canvas.itemconfigure(self.image_asset_window, width=event.width)
+        if self.image_asset_refresh_after:
+            self.root.after_cancel(self.image_asset_refresh_after)
+        self.image_asset_refresh_after = self.root.after(120, self.refresh_image_asset_grid_if_columns_changed)
+
+    def image_asset_column_count(self):
+        canvas_width = self.image_asset_canvas.winfo_width() if hasattr(self, "image_asset_canvas") else 0
+        return max(3, min(8, (canvas_width or 700) // 140))
+
+    def refresh_image_asset_grid_if_columns_changed(self):
+        self.image_asset_refresh_after = None
+        columns = self.image_asset_column_count()
+        if columns != getattr(self, "image_asset_last_columns", 0):
+            self.refresh_image_asset_grid()
+
+    def refresh_image_asset_grid(self):
+        if not hasattr(self, "image_asset_grid"):
+            return
+        for child in self.image_asset_grid.winfo_children():
+            child.destroy()
+        self.image_asset_images.clear()
+        visible_ids = set()
+        keyword = self.image_search_var.get().strip().lower() if hasattr(self, "image_search_var") else ""
+        asset_type = self.image_asset_type_var.get() if hasattr(self, "image_asset_type_var") else "全部"
+        columns = self.image_asset_column_count()
+        self.image_asset_last_columns = columns
+        row = 0
+        col = 0
+        for item in self.materials:
+            display = f"{item.id} @{item.alias} {Path(item.path).name} {item.tags}"
+            if keyword and keyword not in display.lower():
+                continue
+            if asset_type and asset_type != "全部" and asset_type not in item.tags:
+                continue
+            visible_ids.add(item.id)
+            tile = Frame(self.image_asset_grid, bd=0, relief="flat", padx=6, pady=6, width=128, height=150, highlightthickness=1, highlightbackground=COLOR_BORDER)
+            tile.grid(row=row, column=col, padx=6, pady=6, sticky="n")
+            tile.grid_propagate(False)
+            image = None
+            thumb = create_thumbnail(item)
+            if thumb:
+                try:
+                    image = PhotoImage(file=thumb)
+                    self.image_asset_images[item.id] = image
+                except Exception:
+                    image = None
+            image_label = Label(tile, image=image, text="" if image else "无预览", width=104, height=96)
+            image_label.pack()
+            name_label = Label(tile, text=compact_text(f"@{item.alias}", 18), wraplength=108, justify="center")
+            name_label.pack(fill=X, pady=(4, 0))
+
+            def bind_tile(widget, material_id=item.id):
+                widget.bind("<Button-1>", lambda _event, mid=material_id: self.select_image_material(mid))
+                widget.bind("<Double-Button-1>", lambda _event, mid=material_id: self.insert_image_material_ref(mid))
+                widget.bind("<Button-3>", lambda event, mid=material_id: self.show_asset_context_menu(event, mid))
+
+            for widget in (tile, image_label, name_label):
+                bind_tile(widget)
+            if item.id in self.image_selected_material_ids:
+                tile.configure(bg="#0c4a6e", highlightbackground=COLOR_ACCENT)
+                image_label.configure(bg="#0c4a6e", fg="#ffffff")
+                name_label.configure(bg="#0c4a6e", fg="#ffffff")
+            else:
+                tile.configure(bg=COLOR_CARD, highlightbackground=COLOR_BORDER)
+                image_label.configure(bg=COLOR_CARD, fg=COLOR_TEXT)
+                name_label.configure(bg=COLOR_CARD, fg=COLOR_MUTED)
+            col += 1
+            if col >= columns:
+                col = 0
+                row += 1
+        self.image_selected_material_ids.intersection_update(visible_ids)
+
+    def select_image_material(self, material_id):
+        self.image_selected_material_ids = {material_id}
+
+    def insert_image_material_ref(self, material_id):
+        material = self.materials_by_id().get(material_id)
+        if not material:
+            return
+        self.image_prompt_text.focus_set()
+        self.image_prompt_text.insert("insert", f" @{material.alias} ")
+        self.log(f"已插入图片素材引用：@{material.alias}")
+        return "break"
+
     def refresh_one_material_tree(self, tree, image_cache, keyword, asset_type):
         if tree is None:
             return
@@ -3250,7 +4073,8 @@ class GrokVideoStudio:
         ttk.Combobox(row2, textvariable=tags_var, values=self.material_groups, state="readonly", style="Dark.TCombobox").pack(side=LEFT, fill=X, expand=True)
 
         def save():
-            item.alias = safe_alias(alias_var.get(), item.alias)
+            existing = [material.alias for material in self.materials if material.id != item.id]
+            item.alias = unique_alias(alias_var.get(), existing, item.alias)
             item.tags = tags_var.get().strip()
             self.persist_materials()
             self.refresh_materials()
@@ -3322,17 +4146,177 @@ class GrokVideoStudio:
         Button(actions, text="关闭", command=win.destroy).pack(side=RIGHT)
         refresh_list()
 
+    def prompt_template_names(self, kind):
+        templates = self.image_prompt_templates if kind == "image" else self.rewrite_prompt_templates
+        return [item["name"] for item in templates]
+
+    def selected_prompt_template(self, kind):
+        templates = self.image_prompt_templates if kind == "image" else self.rewrite_prompt_templates
+        var = self.image_template_var if kind == "image" else self.rewrite_template_var
+        selected = var.get().strip()
+        return next((item for item in templates if item["name"] == selected), templates[0] if templates else {"name": "", "template": ""})
+
+    def persist_image_prompt_templates(self):
+        write_json(IMAGE_PROMPT_TEMPLATES_FILE, self.image_prompt_templates)
+
+    def persist_rewrite_prompt_templates(self):
+        write_json(REWRITE_PROMPT_TEMPLATES_FILE, self.rewrite_prompt_templates)
+
+    def persist_rewrite_history(self):
+        write_json(REWRITE_HISTORY_FILE, self.rewrite_history[:100])
+
+    def refresh_prompt_template_combos(self):
+        if hasattr(self, "image_template_combo"):
+            names = self.prompt_template_names("image")
+            self.image_template_combo.configure(values=names)
+            if self.image_template_var.get() not in names and names:
+                self.image_template_var.set(names[0])
+        if hasattr(self, "rewrite_template_combo"):
+            names = self.prompt_template_names("rewrite")
+            self.rewrite_template_combo.configure(values=names)
+            if self.rewrite_template_var.get() not in names and names:
+                self.rewrite_template_var.set(names[0])
+
+    def open_prompt_template_manager(self, kind):
+        title = "图片提示词模板" if kind == "image" else "文案改写提示词模板"
+        templates = self.image_prompt_templates if kind == "image" else self.rewrite_prompt_templates
+        selected_var = self.image_template_var if kind == "image" else self.rewrite_template_var
+        win = Toplevel(self.root)
+        win.title(f"自定义{title}")
+        win.geometry("760x520")
+        win.transient(self.root)
+
+        left = Frame(win, padx=10, pady=10)
+        left.pack(side=LEFT, fill=Y)
+        listbox = Listbox(
+            left,
+            width=24,
+            bg=COLOR_INPUT,
+            fg=COLOR_TEXT,
+            selectbackground=COLOR_ACCENT_DARK,
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+        )
+        listbox.pack(fill=BOTH, expand=True)
+
+        right = Frame(win, padx=10, pady=10)
+        right.pack(side=RIGHT, fill=BOTH, expand=True)
+        Label(right, text="模板名称", anchor="w").pack(fill=X)
+        name_var = StringVar()
+        Entry(right, textvariable=name_var).pack(fill=X, pady=(4, 8))
+        hint = "可使用 {prompt} 代表当前图片提示词。" if kind == "image" else "必须使用或自动追加 {source} 原始文案。"
+        Label(right, text=hint, anchor="w", fg=COLOR_MUTED).pack(fill=X, pady=(0, 4))
+        template_text = Text(right, wrap="word", height=18)
+        template_text.pack(fill=BOTH, expand=True)
+
+        def refresh_list(select_name=None):
+            listbox.delete(0, END)
+            for item in templates:
+                listbox.insert(END, item["name"])
+            target = select_name or selected_var.get()
+            for index, item in enumerate(templates):
+                if item["name"] == target:
+                    listbox.selection_clear(0, END)
+                    listbox.selection_set(index)
+                    listbox.activate(index)
+                    listbox.see(index)
+                    load_selection()
+                    break
+
+        def current_index():
+            selection = listbox.curselection()
+            return selection[0] if selection else None
+
+        def load_selection(_event=None):
+            index = current_index()
+            if index is None or index >= len(templates):
+                return
+            item = templates[index]
+            name_var.set(item["name"])
+            template_text.delete("1.0", END)
+            template_text.insert("1.0", item["template"])
+
+        def save_template():
+            name = name_var.get().strip()
+            template = template_text.get("1.0", END).strip()
+            if not name or not template:
+                messagebox.showinfo(title, "请填写模板名称和模板内容。", parent=win)
+                return
+            index = current_index()
+            duplicate = next((i for i, item in enumerate(templates) if item["name"] == name and i != index), None)
+            if duplicate is not None:
+                messagebox.showinfo(title, "模板名称已存在，请换一个名称。", parent=win)
+                return
+            if index is None or index >= len(templates):
+                templates.append({"name": name, "template": template})
+            else:
+                templates[index] = {"name": name, "template": template}
+            selected_var.set(name)
+            if kind == "image":
+                self.persist_image_prompt_templates()
+            else:
+                self.persist_rewrite_prompt_templates()
+            self.refresh_prompt_template_combos()
+            refresh_list(name)
+            self.log(f"已保存{title}：{name}")
+
+        def new_template():
+            listbox.selection_clear(0, END)
+            name_var.set("")
+            template_text.delete("1.0", END)
+            template_text.insert("1.0", "{prompt}" if kind == "image" else "{source}")
+
+        def delete_template():
+            index = current_index()
+            if index is None or index >= len(templates):
+                return
+            if len(templates) <= 1:
+                messagebox.showinfo(title, "至少保留一个模板。", parent=win)
+                return
+            name = templates[index]["name"]
+            if not messagebox.askyesno(title, f"确定删除模板“{name}”？", parent=win):
+                return
+            del templates[index]
+            selected_var.set(templates[0]["name"])
+            if kind == "image":
+                self.persist_image_prompt_templates()
+            else:
+                self.persist_rewrite_prompt_templates()
+            self.refresh_prompt_template_combos()
+            refresh_list()
+
+        listbox.bind("<<ListboxSelect>>", load_selection)
+        actions = Frame(right, pady=8)
+        actions.pack(fill=X)
+        Button(actions, text="新建", command=new_template).pack(side=LEFT)
+        Button(actions, text="删除", command=delete_template).pack(side=LEFT, padx=(8, 0))
+        Button(actions, text="保存", command=save_template).pack(side=RIGHT)
+        Button(actions, text="关闭", command=win.destroy).pack(side=RIGHT, padx=(0, 8))
+        refresh_list()
+
+    def apply_selected_image_template(self):
+        item = self.selected_prompt_template("image")
+        current = self.image_prompt_text.get("1.0", END).strip()
+        content = apply_prompt_template(item.get("template", ""), "prompt", current)
+        self.image_prompt_text.delete("1.0", END)
+        self.image_prompt_text.insert("1.0", content)
+        self.log(f"已调用图片提示词模板：{item.get('name', '')}")
+
     def rewrite_copy_async(self):
         source = self.rewrite_input_text.get("1.0", END).strip()
         if not source:
             messagebox.showwarning("文案改写", "请先输入需要改写的视频文案。")
             return
-        prompt = REWRITE_PROMPT_TEMPLATE.format(source=source)
-        self.log("文案改写中：已使用内置 Grok 分镜改写提示词")
-        thread = threading.Thread(target=self.rewrite_copy_worker, args=(prompt,), daemon=True)
+        template = self.selected_prompt_template("rewrite")
+        prompt = apply_prompt_template(template.get("template", ""), "source", source)
+        self.log(f"文案改写中：已使用模板 {template.get('name', '')}")
+        thread = threading.Thread(target=self.rewrite_copy_worker, args=(prompt, source, template.get("name", "")), daemon=True)
         thread.start()
 
-    def rewrite_copy_worker(self, prompt):
+    def rewrite_copy_worker(self, prompt, source="", template_name=""):
         try:
             result = chat_completion_text(
                 prompt,
@@ -3342,10 +4326,90 @@ class GrokVideoStudio:
             )
             if not result:
                 raise RuntimeError("文本模型没有返回改写结果")
+            self.rewrite_history.insert(0, {
+                "id": uuid.uuid4().hex[:12],
+                "created_at": now_text(),
+                "template": template_name,
+                "source": source,
+                "output": result,
+            })
+            self.rewrite_history = self.rewrite_history[:100]
+            self.persist_rewrite_history()
             self.event_queue.put(("rewrite_output", result))
             self.event_queue.put(("log", "文案改写完成"))
         except Exception as exc:
             self.event_queue.put(("log", f"文案改写失败：{exc}"))
+
+    def show_rewrite_history(self):
+        win = Toplevel(self.root)
+        win.title("文案改写历史记录")
+        win.geometry("820x520")
+        win.transient(self.root)
+        left = Frame(win, padx=10, pady=10, width=260)
+        left.pack(side=LEFT, fill=Y)
+        left.pack_propagate(False)
+        listbox = Listbox(left)
+        listbox.pack(fill=BOTH, expand=True)
+        right = Frame(win, padx=(0, 10), pady=10)
+        right.pack(side=RIGHT, fill=BOTH, expand=True)
+        detail = Text(right, wrap="word")
+        detail.pack(fill=BOTH, expand=True)
+        actions = Frame(right)
+        actions.pack(fill=X, pady=(8, 0))
+
+        def record_label(record):
+            created_at = record.get("created_at", "")
+            template = record.get("template", "") or "未命名模板"
+            source = compact_text(record.get("source", ""), 22)
+            return compact_text(f"{created_at}  {template}  {source}", 48)
+
+        for record in self.rewrite_history:
+            listbox.insert(END, record_label(record))
+
+        def selected_record():
+            selection = listbox.curselection()
+            if not selection:
+                return None
+            index = selection[0]
+            if index >= len(self.rewrite_history):
+                return None
+            return self.rewrite_history[index]
+
+        def show_selected(_event=None):
+            record = selected_record()
+            detail.delete("1.0", END)
+            if not record:
+                return
+            detail.insert("1.0", (
+                f"时间：{record.get('created_at', '')}\n"
+                f"模板：{record.get('template', '')}\n\n"
+                f"原文：\n{record.get('source', '')}\n\n"
+                f"改写结果：\n{record.get('output', '')}"
+            ))
+
+        def fill_source():
+            record = selected_record()
+            if not record:
+                return
+            self.rewrite_input_text.delete("1.0", END)
+            self.rewrite_input_text.insert("1.0", record.get("source", ""))
+            win.destroy()
+
+        def fill_output():
+            record = selected_record()
+            if not record:
+                return
+            self.rewrite_output_text.delete("1.0", END)
+            self.rewrite_output_text.insert("1.0", record.get("output", ""))
+            win.destroy()
+
+        Button(actions, text="填入原文", command=fill_source).pack(side=LEFT)
+        Button(actions, text="填入结果", command=fill_output).pack(side=LEFT, padx=(8, 0))
+        Button(actions, text="关闭", command=win.destroy).pack(side=RIGHT)
+        listbox.bind("<<ListboxSelect>>", show_selected)
+        if self.rewrite_history:
+            listbox.selection_set(0)
+            show_selected()
 
     def use_rewrite_output(self):
         text = self.rewrite_output_text.get("1.0", END).strip()
@@ -3357,6 +4421,32 @@ class GrokVideoStudio:
         self.show_section("generate")
         self.log("已把改写结果填入视频生成页")
 
+    def update_image_size_from_dimensions(self):
+        width = text_value(self.image_width_var.get()).strip()
+        height = text_value(self.image_height_var.get()).strip()
+        if width.isdigit() and height.isdigit():
+            self.image_size_var.set(f"{int(width)}x{int(height)}")
+
+    def set_image_aspect_size(self, label, width, height):
+        self.image_aspect_var.set(label)
+        self.image_width_var.set(str(width))
+        self.image_height_var.set(str(height))
+        self.image_size_var.set(f"{int(width)}x{int(height)}")
+        self.image_status_var.set(self.image_size_var.get())
+
+    def current_image_size(self):
+        width = text_value(self.image_width_var.get()).strip()
+        height = text_value(self.image_height_var.get()).strip()
+        if not width.isdigit() or not height.isdigit():
+            raise ValueError("图片宽高必须是数字。")
+        width_int = int(width)
+        height_int = int(height)
+        if width_int <= 0 or height_int <= 0:
+            raise ValueError("图片宽高必须大于 0。")
+        size = f"{width_int}x{height_int}"
+        self.image_size_var.set(size)
+        return size
+
     def choose_image_references(self):
         self.log("打开图片参考图选择窗口")
         paths = filedialog.askopenfilenames(
@@ -3366,28 +4456,190 @@ class GrokVideoStudio:
         if not paths:
             self.log("未选择图片参考图")
             return
-        self.image_reference_paths = list(paths)[:MAX_REFERENCE_IMAGES]
-        names = [Path(path).name for path in self.image_reference_paths]
-        self.image_reference_var.set(f"参考图 {len(names)} 张：{', '.join(names[:3])}" + (" ..." if len(names) > 3 else ""))
+        imported_ids = self.import_reference_materials(paths)
+        refs = list(self.image_reference_paths)
+        for material_id in imported_ids:
+            if material_id not in refs:
+                refs.append(material_id)
+        self.set_image_references(refs)
         self.log(f"已选择图片参考图 {len(self.image_reference_paths)} 张")
+
+    def choose_video_references(self):
+        self.log("打开视频参考图选择窗口")
+        paths = filedialog.askopenfilenames(
+            title="上传视频生成参考图",
+            filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.bmp"), ("所有文件", "*.*")]
+        )
+        if not paths:
+            self.log("未选择视频参考图")
+            return
+        imported_ids = self.import_reference_materials(paths)
+        refs = list(self.video_reference_paths)
+        for material_id in imported_ids:
+            if material_id not in refs:
+                refs.append(material_id)
+        self.set_video_references(refs)
+        self.log(f"已选择视频参考图 {len(self.video_reference_paths)} 张")
+
+    def import_reference_materials(self, paths):
+        imported_ids = []
+        group = "上传参考图"
+        if group not in self.material_groups:
+            self.material_groups.append(group)
+            self.persist_material_groups()
+        for path in paths:
+            src = Path(path)
+            if not src.exists():
+                continue
+            material_id = uuid.uuid4().hex[:12]
+            dest = MATERIAL_DIR / f"{material_id}_{safe_name(src.name)}"
+            try:
+                shutil.copy2(src, dest)
+            except Exception as exc:
+                self.log(f"参考图导入失败：{src} {exc}")
+                continue
+            alias = unique_alias(src.stem, [material.alias for material in self.materials], f"ref_{material_id[:6]}")
+            self.materials.append(Material(
+                id=material_id,
+                alias=alias,
+                path=str(dest),
+                added_at=now_text(),
+                tags=group,
+            ))
+            imported_ids.append(material_id)
+        if imported_ids:
+            self.persist_materials()
+            self.refresh_materials()
+        return imported_ids
+
+    def update_image_reference_label(self):
+        refs = list(self.image_reference_paths)[:MAX_REFERENCE_IMAGES]
+        if not refs:
+            self.image_reference_var.set("未上传参考图")
+            self.refresh_reference_strip("image")
+            return
+        materials = self.materials_by_id()
+        names = []
+        for ref in refs:
+            if ref in materials:
+                names.append(f"@{materials[ref].alias}")
+            else:
+                names.append(Path(ref).name)
+        self.image_reference_var.set(f"参考图 {len(names)} 张：{', '.join(names[:3])}" + (" ..." if len(names) > 3 else ""))
+        self.refresh_reference_strip("image")
+
+    def set_image_references(self, refs):
+        clean_refs = []
+        materials = self.materials_by_id()
+        for ref in refs or []:
+            ref = text_value(ref).strip()
+            if not ref:
+                continue
+            if ref in materials or Path(ref).exists():
+                clean_refs.append(ref)
+        self.image_reference_paths = clean_refs[:MAX_REFERENCE_IMAGES]
+        self.update_image_reference_label()
+
+    def update_video_reference_label(self):
+        refs = list(self.video_reference_paths)[:MAX_REFERENCE_IMAGES]
+        if not refs:
+            self.video_reference_var.set("未上传参考图")
+            self.refresh_reference_strip("video")
+            return
+        materials = self.materials_by_id()
+        names = []
+        for ref in refs:
+            if ref in materials:
+                names.append(f"@{materials[ref].alias}")
+            else:
+                names.append(Path(ref).name)
+        self.video_reference_var.set(f"参考图 {len(names)} 张：{', '.join(names[:3])}" + (" ..." if len(names) > 3 else ""))
+        self.refresh_reference_strip("video")
+
+    def set_video_references(self, refs):
+        clean_refs = []
+        materials = self.materials_by_id()
+        for ref in refs or []:
+            ref = text_value(ref).strip()
+            if not ref:
+                continue
+            if ref in materials or Path(ref).exists():
+                clean_refs.append(ref)
+        self.video_reference_paths = clean_refs[:MAX_REFERENCE_IMAGES]
+        self.update_video_reference_label()
+
+    def refresh_reference_strip(self, kind):
+        frame = getattr(self, f"{kind}_reference_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        refs = list(getattr(self, f"{kind}_reference_paths", []))[:MAX_REFERENCE_IMAGES]
+        cache = getattr(self, f"{kind}_reference_images", None)
+        if cache is not None:
+            for key in list(cache.keys()):
+                if str(key).startswith("strip_"):
+                    cache.pop(key, None)
+        materials = self.materials_by_id()
+        for ref in refs:
+            material = materials.get(ref)
+            path = material.path if material else ref
+            temp = material or Material(id=uuid.uuid5(uuid.NAMESPACE_URL, str(path)).hex[:12], alias=Path(path).stem, path=path, added_at="")
+            tile = Frame(frame, width=82, height=106, padx=3, pady=3, highlightthickness=1, highlightbackground=COLOR_BORDER, bg=COLOR_CARD)
+            tile.pack(side=LEFT, padx=(0, 6), pady=(0, 4))
+            tile.pack_propagate(False)
+            top = Frame(tile, bg=COLOR_CARD)
+            top.pack(fill=X)
+            Button(top, text="×", width=2, command=lambda value=ref, k=kind: self.remove_reference(k, value)).pack(side=RIGHT)
+            image = None
+            thumb = create_thumbnail(temp, size=68)
+            if thumb:
+                try:
+                    image = PhotoImage(file=thumb)
+                    if cache is not None:
+                        cache[f"strip_{kind}_{ref}"] = image
+                except Exception:
+                    image = None
+            Label(tile, image=image, text="" if image else "无预览", width=68, height=64, bg=COLOR_CARD).pack()
+            name = f"@{material.alias}" if material else Path(path).name
+            Label(tile, text=compact_text(name, 12), wraplength=72, justify="center", bg=COLOR_CARD, fg=COLOR_MUTED).pack(fill=X)
+
+    def remove_reference(self, kind, ref):
+        attr = f"{kind}_reference_paths"
+        refs = [item for item in getattr(self, attr, []) if item != ref]
+        if kind == "image":
+            self.set_image_references(refs)
+        else:
+            self.set_video_references(refs)
 
     def generate_image_async(self):
         prompt = self.image_prompt_text.get("1.0", END).strip()
         if not prompt:
             messagebox.showwarning("图片生成", "请先输入图片提示词。")
             return
-        refs = list(self.image_reference_paths)
+        refs = self.resolve_prompt_refs(prompt)
+        for ref in self.image_reference_paths:
+            if ref not in refs:
+                refs.append(ref)
+        refs = refs[:MAX_REFERENCE_IMAGES]
+        try:
+            size = self.current_image_size()
+        except ValueError as exc:
+            messagebox.showwarning("图片尺寸", str(exc))
+            return
+        quality = self.image_quality_var.get().strip() or "auto"
         task = ImageTask(
             id=uuid.uuid4().hex[:12],
             prompt=prompt,
-            size=self.image_size_var.get(),
-            references=refs[:MAX_REFERENCE_IMAGES],
+            size=size,
+            references=refs,
+            quality=quality,
             status="queued",
         )
         self.image_tasks.insert(0, task)
         self.persist_image_tasks()
         self.refresh_image_tasks()
-        self.image_status_var.set("已加入任务")
+        self.image_status_var.set(task.size)
         self.log(f"已加入图片生成任务：{task.id}，尺寸 {task.size}，参考图 {len(task.references)} 张")
         thread = threading.Thread(target=self.generate_image_worker, args=(task.id,), daemon=True)
         thread.start()
@@ -3414,6 +4666,7 @@ class GrokVideoStudio:
                 text_value(self.settings.get("image_poll_path") or DEFAULT_IMAGE_POLL_PATH),
                 lambda status: self.event_queue.put(("image_task_status", (task.id, status))),
                 reference_paths,
+                task.quality,
             )
             task.output_path = str(path)
             self.update_image_task(task, status="done", output_path=str(path))
@@ -3443,6 +4696,23 @@ class GrokVideoStudio:
         self.persist_image_tasks()
         self.event_queue.put(("refresh_image_tasks", None))
 
+    def image_task_status_label(self, status):
+        status_text = text_value(status).strip()
+        if not status_text:
+            return "待生成"
+        if status_text.startswith("已提交：") or status_text.startswith("生成中：") or status_text.startswith("任务状态："):
+            return status_text
+        labels = dict(STATUS_LABELS)
+        labels.update({
+            "refreshing": "刷新中",
+            "pending": "待生成",
+            "error": "失败",
+            "expired": "已过期",
+            "canceled": "已取消",
+            "cancelled": "已取消",
+        })
+        return labels.get(status_text, status_text)
+
     def refresh_image_tasks(self):
         if not hasattr(self, "image_task_tree"):
             return
@@ -3451,9 +4721,10 @@ class GrokVideoStudio:
         for item_id in self.image_task_tree.get_children():
             self.image_task_tree.delete(item_id)
         for task in self.image_tasks:
-            output = Path(task.output_path).name if task.output_path else compact_text(task.error or task.status, 60)
+            status_label = self.image_task_status_label(task.status)
+            output = Path(task.output_path).name if task.output_path else compact_text(task.error or status_label, 60)
             self.image_task_tree.insert("", END, iid=task.id, values=(
-                task.status,
+                status_label,
                 compact_text(task.prompt, 60),
                 str(len(task.references)),
                 task.request_id,
@@ -3490,6 +4761,32 @@ class GrokVideoStudio:
             self.log(f"查看图片任务：{task.id}")
         self.show_image_task(task)
 
+    def reuse_image_task_from_event(self, event):
+        item_id = self.image_task_tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.image_task_tree.selection_set(item_id)
+        self.image_task_tree.focus(item_id)
+        task = next((item for item in self.image_tasks if item.id == item_id), None)
+        self.reuse_image_task(task)
+
+    def reuse_image_task(self, task):
+        if not task:
+            return
+        self.image_prompt_text.delete("1.0", END)
+        self.image_prompt_text.insert("1.0", task.prompt)
+        if task.size:
+            self.image_size_var.set(task.size)
+            size_match = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", task.size, re.IGNORECASE)
+            if size_match:
+                self.image_width_var.set(size_match.group(1))
+                self.image_height_var.set(size_match.group(2))
+        if getattr(task, "quality", ""):
+            self.image_quality_var.set(task.quality)
+        self.set_image_references(task.references)
+        self.image_status_var.set("已复用任务参数")
+        self.log(f"已复用图片任务提示词和参考图：{task.id}")
+
     def show_image_task(self, task):
         if not task:
             return
@@ -3498,16 +4795,19 @@ class GrokVideoStudio:
             self.show_generated_image(task.output_path)
         elif task.error:
             self.generated_preview_image = None
-            self.generated_image_label.configure(
-                image="",
-                text=f"任务失败\n\n{task.error}\n\n可右键该任务选择“刷新任务状态”查询一次最新状态。",
-            )
+            if getattr(self, "generated_image_label", None):
+                self.generated_image_label.configure(
+                    image="",
+                    text=f"任务失败\n\n{task.error}\n\n可右键该任务选择“刷新任务状态”查询一次最新状态。",
+                )
             self.image_status_var.set("任务失败，可右键刷新状态")
             self.log(f"查看失败图片任务：{task.id}")
         else:
             self.generated_preview_image = None
-            self.generated_image_label.configure(image="", text=f"任务状态：{task.status or '待处理'}")
-            self.image_status_var.set(task.status)
+            status_label = self.image_task_status_label(task.status)
+            if getattr(self, "generated_image_label", None):
+                self.generated_image_label.configure(image="", text=f"任务状态：{status_label}")
+            self.image_status_var.set(status_label)
 
     def show_image_task_context_menu(self, event):
         item_id = self.image_task_tree.identify_row(event.y)
@@ -3516,12 +4816,52 @@ class GrokVideoStudio:
         self.image_task_tree.selection_set(item_id)
         self.image_task_tree.focus(item_id)
         menu = Menu(self.root, tearoff=0)
+        menu.add_command(label="复用提示词和参考图", command=lambda: self.reuse_image_task(self.selected_image_task()))
+        menu.add_command(label="查看原图", command=self.open_selected_image_task_output)
+        menu.add_command(label="打开所在文件夹", command=self.open_selected_image_task_folder)
+        menu.add_command(label="加入资产库", command=self.add_selected_image_task_to_materials)
+        menu.add_separator()
         menu.add_command(label="刷新任务状态", command=self.refresh_selected_image_task_once)
         menu.add_command(label="删除任务", command=self.delete_selected_image_task)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def selected_image_task_output_path(self):
+        task = self.selected_image_task()
+        if not task:
+            return ""
+        output_path = resolve_image_output_path(task.output_path, task)
+        return output_path if output_path and Path(output_path).exists() else ""
+
+    def open_selected_image_task_output(self):
+        output_path = self.selected_image_task_output_path()
+        if not output_path:
+            messagebox.showinfo("查看原图", "该图片任务还没有可用的本地结果。")
+            return
+        self.open_local_image(output_path)
+
+    def open_selected_image_task_folder(self):
+        output_path = self.selected_image_task_output_path()
+        if not output_path:
+            messagebox.showinfo("打开所在文件夹", "该图片任务还没有可用的本地结果。")
+            return
+        path = Path(output_path)
+        try:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        except Exception:
+            os.startfile(path.parent)
+
+    def add_selected_image_task_to_materials(self):
+        task = self.selected_image_task()
+        output_path = self.selected_image_task_output_path()
+        if not task or not output_path:
+            messagebox.showinfo("加入资产库", "该图片任务还没有可用的本地结果。")
+            return
+        self.last_generated_image_path = output_path
+        self.last_generated_image_task_id = task.id
+        self.add_generated_image_to_materials()
 
     def delete_selected_image_task(self):
         task = self.selected_image_task()
@@ -3589,6 +4929,8 @@ class GrokVideoStudio:
 
     def show_generated_image(self, path):
         self.last_generated_image_path = path
+        task = next((item for item in self.image_tasks if resolve_image_output_path(item.output_path, item) == str(path)), None)
+        self.last_generated_image_task_id = task.id if task else ""
         image = None
         preview_id = "generated_preview_" + uuid.uuid5(uuid.NAMESPACE_URL, str(Path(path).resolve())).hex[:12]
         temp_material = Material(id=preview_id, alias="preview", path=path, added_at=now_text())
@@ -3599,10 +4941,12 @@ class GrokVideoStudio:
             except Exception:
                 image = None
         self.generated_preview_image = image
-        if image:
-            self.generated_image_label.configure(image=image, text="")
-        else:
-            self.generated_image_label.configure(text=Path(path).name, image="")
+        if getattr(self, "generated_image_label", None):
+            if image:
+                self.generated_image_label.configure(image=image, text="")
+            else:
+                self.generated_image_label.configure(text=Path(path).name, image="")
+            self.generated_image_label.bind("<Double-Button-1>", lambda _event, image_path=path: self.open_local_image(image_path))
         self.image_status_var.set("生成完成")
 
     def add_generated_image_to_materials(self):
@@ -3629,8 +4973,21 @@ class GrokVideoStudio:
             material_id = uuid.uuid4().hex[:12]
             dest = MATERIAL_DIR / f"{material_id}_{safe_name(src.name)}"
             shutil.copy2(src, dest)
-            alias = safe_alias(alias_var.get(), f"ai_image_{material_id[:6]}")
-            self.materials.append(Material(id=material_id, alias=alias, path=str(dest), added_at=now_text(), tags=group_var.get().strip() or "AI生成"))
+            alias = unique_alias(alias_var.get(), [material.alias for material in self.materials], f"ai_image_{material_id[:6]}")
+            source_task = None
+            if self.last_generated_image_task_id:
+                source_task = next((item for item in self.image_tasks if item.id == self.last_generated_image_task_id), None)
+            if source_task is None:
+                source_task = next((item for item in self.image_tasks if resolve_image_output_path(item.output_path, item) == str(src)), None)
+            self.materials.append(Material(
+                id=material_id,
+                alias=alias,
+                path=str(dest),
+                added_at=now_text(),
+                tags=group_var.get().strip() or "AI生成",
+                prompt=source_task.prompt if source_task else "",
+                references=list(source_task.references) if source_task else [],
+            ))
             self.persist_materials()
             self.refresh_materials()
             self.log(f"生成图片已加入资产库：@{alias}")
@@ -3687,7 +5044,12 @@ class GrokVideoStudio:
         for item in selected:
             if item not in refs:
                 refs.append(item)
+        for item in self.video_reference_paths:
+            if item not in refs:
+                refs.append(item)
         refs = refs[:MAX_REFERENCE_IMAGES]
+        if refs:
+            self.set_video_references(refs)
         if refs and duration > 10:
             messagebox.showwarning("参考图模式限制", "使用参考图时，xAI 当前限制最长 10 秒。")
             return
@@ -3786,25 +5148,60 @@ class GrokVideoStudio:
         messagebox.showinfo("批量保存完成", f"已保存 {count} 个视频文件。\n缺失 {missing} 个。")
 
     def delete_selected_tasks(self):
-        ids = set(self.task_tree.selection())
+        ids = {task.id for task in self.selected_tasks()}
         if not ids:
+            messagebox.showinfo("删除任务", "请先勾选或选择要删除的视频任务。")
             return
         if not messagebox.askyesno("删除任务", f"确定删除 {len(ids)} 条任务？"):
             return
         self.tasks = [task for task in self.tasks if task.id not in ids]
+        self.task_checked_ids.difference_update(ids)
         self.persist_tasks()
         self.refresh_tasks()
         self.log(f"已删除视频任务 {len(ids)} 条")
 
     def selected_tasks(self):
-        ids = set(self.task_tree.selection())
+        ids = set(self.task_checked_ids)
+        if not ids and hasattr(self, "task_tree"):
+            ids = set(self.task_tree.selection())
         return [task for task in self.tasks if task.id in ids]
+
+    def handle_task_tree_click(self, event):
+        if self.task_tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.task_tree.identify_column(event.x) != "#2":
+            return
+        item_id = self.task_tree.identify_row(event.y)
+        if not item_id:
+            return
+        if item_id in self.task_checked_ids:
+            self.task_checked_ids.remove(item_id)
+        else:
+            self.task_checked_ids.add(item_id)
+        self.refresh_tasks()
+        return "break"
+
+    def toggle_all_video_tasks(self):
+        all_ids = {task.id for task in self.tasks}
+        if all_ids and all_ids.issubset(self.task_checked_ids):
+            self.task_checked_ids.clear()
+            self.log("已取消全选视频任务")
+        else:
+            self.task_checked_ids = set(all_ids)
+            self.log(f"已全选视频任务 {len(self.task_checked_ids)} 条")
+        self.refresh_tasks()
+
+    def start_checked_or_selected_tasks(self):
+        self.start_selected_tasks()
+
+    def pause_checked_or_selected_tasks(self):
+        self.pause_selected_tasks()
 
     def show_task_context_menu(self, event):
         item_id = self.task_tree.identify_row(event.y)
         if not item_id:
             return
-        if item_id not in self.task_tree.selection():
+        if item_id not in self.task_tree.selection() and item_id not in self.task_checked_ids:
             self.task_tree.selection_set(item_id)
             self.task_tree.focus(item_id)
 
@@ -3902,12 +5299,20 @@ class GrokVideoStudio:
         self.log(f"已复用任务 {task.id} 的提示词和参数")
 
     def refresh_tasks(self):
+        if not hasattr(self, "task_tree"):
+            return
+        existing_task_ids = {task.id for task in self.tasks}
+        self.task_checked_ids.intersection_update(existing_task_ids)
+        selection = set(self.task_tree.selection())
+        focused = self.task_tree.focus()
         for item in self.task_tree.get_children():
             self.task_tree.delete(item)
-        for task in self.tasks:
+        for index, task in enumerate(self.tasks, 1):
             params = f"{task.aspect_ratio} / {task.duration}s / {task.resolution}"
             output = Path(task.output_path).name if task.output_path else task_error_summary(task)
             self.task_tree.insert("", END, iid=task.id, values=(
+                index,
+                "☑" if task.id in self.task_checked_ids else "☐",
                 STATUS_LABELS.get(task.status, task.status),
                 task.prompt.replace("\n", " ")[:120],
                 params,
@@ -3916,6 +5321,12 @@ class GrokVideoStudio:
                 output,
                 task.updated_at,
             ))
+        existing_ids = set(self.task_tree.get_children())
+        kept_selection = [item_id for item_id in selection if item_id in existing_ids]
+        if kept_selection:
+            self.task_tree.selection_set(kept_selection)
+        if focused in existing_ids:
+            self.task_tree.focus(focused)
 
     def materials_by_id(self):
         return {item.id: item for item in self.materials}
@@ -3927,7 +5338,25 @@ class GrokVideoStudio:
         write_json(GROUPS_FILE, self.material_groups)
 
     def persist_agent_conversations(self):
-        write_json(AGENT_CONVERSATIONS_FILE, [item.__dict__ for item in self.agent_conversations])
+        data = []
+        for item in self.agent_conversations:
+            record = item.__dict__.copy()
+            clean_messages = []
+            for message in item.messages:
+                content = text_value(message.get("content"))
+                if not content.strip():
+                    continue
+                clean = {"role": message.get("role", "user"), "content": content}
+                model_content = message.get("model_content")
+                if isinstance(model_content, str) and model_content.strip():
+                    clean["model_content"] = model_content
+                attachments = message.get("attachments")
+                if isinstance(attachments, list) and attachments:
+                    clean["attachments"] = attachments
+                clean_messages.append(clean)
+            record["messages"] = clean_messages
+            data.append(record)
+        write_json(AGENT_CONVERSATIONS_FILE, data)
 
     def persist_tasks(self):
         write_json(TASKS_FILE, [item.__dict__ for item in self.tasks])
@@ -4118,18 +5547,35 @@ class GrokVideoStudio:
                     task_id, status = payload
                     task = next((item for item in self.image_tasks if item.id == task_id), None)
                     if task:
-                        task.status = status
-                        if status.startswith("已提交："):
-                            task.request_id = status.split("：", 1)[1]
+                        display_status = text_value(status)
+                        if display_status.startswith("已提交："):
+                            task.status = "submitted"
+                            task.request_id = display_status.split("：", 1)[1]
+                        elif display_status.startswith("生成中："):
+                            task.status = "processing"
+                        elif display_status.startswith("任务状态："):
+                            task.status = display_status.split("：", 1)[1] or "processing"
+                        else:
+                            task.status = display_status
                         task.updated_at = now_text()
                         self.persist_image_tasks()
                     self.refresh_image_tasks()
-                    self.image_status_var.set(status)
+                    self.image_status_var.set(self.image_task_status_label(status))
                 elif event == "refresh_image_tasks":
                     self.refresh_image_tasks()
                 elif event == "agent_response":
                     if payload == self.current_agent_conversation_id:
                         self.show_agent_conversation()
+                    self.refresh_agent_conversations()
+                elif event == "agent_stream_delta":
+                    conversation_id, delta = payload
+                    self.append_agent_stream_delta(conversation_id, delta)
+                elif event == "agent_stream_done":
+                    if payload == self.current_agent_conversation_id and hasattr(self, "agent_chat_text"):
+                        self.agent_chat_text.configure(state="normal")
+                        self.agent_chat_text.insert(END, "\n\n", "message_body")
+                        self.agent_chat_text.configure(state="disabled")
+                        self.agent_chat_text.see(END)
                     self.refresh_agent_conversations()
                 elif event == "worker_idle":
                     self.worker_stop.set()
