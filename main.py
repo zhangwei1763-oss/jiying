@@ -67,22 +67,22 @@ APP_NAME = "极影AI"
 APP_VERSION = "1.0"
 DEFAULT_LICENSE_SERVER_URL = "http://64.83.47.98:8765"
 APP_ICON_FILE = RESOURCE_DIR / "assets" / "app_icon.ico"
-COLOR_BG = "#070b12"
-COLOR_NAV = "#0b1220"
-COLOR_PANEL = "#101827"
-COLOR_PANEL_2 = "#151f31"
-COLOR_CARD = "#182234"
-COLOR_BORDER = "#2a3446"
-COLOR_TEXT = "#e8edf5"
-COLOR_MUTED = "#9aa7ba"
-COLOR_ACCENT = "#38bdf8"
-COLOR_ACCENT_DARK = "#075985"
+COLOR_BG = "#0b1020"
+COLOR_NAV = "#141b2a"
+COLOR_PANEL = "#111827"
+COLOR_PANEL_2 = "#172033"
+COLOR_CARD = "#172133"
+COLOR_BORDER = "#263247"
+COLOR_TEXT = "#f8fafc"
+COLOR_MUTED = "#a8b3c7"
+COLOR_ACCENT = "#60a5fa"
+COLOR_ACCENT_DARK = "#3157ff"
 COLOR_SUCCESS = "#22c55e"
-COLOR_INPUT = "#0c1422"
-FONT_BODY = ("Microsoft YaHei UI", 10)
-FONT_SMALL = ("Microsoft YaHei UI", 9)
-FONT_TITLE = ("Microsoft YaHei UI", 16, "bold")
-FONT_SECTION = ("Microsoft YaHei UI", 11, "bold")
+COLOR_INPUT = "#101827"
+FONT_BODY = ("Microsoft YaHei UI", 11)
+FONT_SMALL = ("Microsoft YaHei UI", 10)
+FONT_TITLE = ("Microsoft YaHei UI", 18, "bold")
+FONT_SECTION = ("Microsoft YaHei UI", 13, "bold")
 STATUS_LABELS = {
     "queued": "待提交",
     "submitting": "提交中",
@@ -2071,23 +2071,39 @@ class GrokVideoStudio:
         menu.add_cascade(label="文件", menu=file_menu)
         self.root.config(menu=menu)
 
-        top = Frame(self.root, padx=14, pady=10, bg=COLOR_BG)
+        top = Frame(self.root, padx=28, pady=14, bg="#0f1625", highlightthickness=1, highlightbackground=COLOR_BORDER)
         top.pack(fill=X)
-        Label(top, text="AI 视频内容工作台", font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_TEXT).pack(side=LEFT)
-        Button(top, text="配置 AI", command=self.open_ai_settings, bg=COLOR_ACCENT_DARK).pack(side=LEFT, padx=(18, 0))
-        Button(top, text="打开输出目录", command=self.open_output_dir).pack(side=LEFT, padx=(8, 0))
-        Label(top, textvariable=self.status_var, anchor="e", bg=COLOR_BG, fg=COLOR_MUTED, font=FONT_SMALL).pack(side=RIGHT)
+        brand = Frame(top, bg="#0f1625")
+        brand.pack(side=LEFT, fill=X, expand=True)
+        Label(brand, text="极影AI", font=("Microsoft YaHei UI", 18, "bold"), bg="#0f1625", fg=COLOR_TEXT).pack(side=LEFT)
+        Label(brand, text="AI", font=("Microsoft YaHei UI", 9, "bold"), bg="#4f46e5", fg="#ffffff", padx=5, pady=1).pack(side=LEFT, padx=(10, 0), pady=(2, 0))
+        Button(top, text="♛  专业版", command=self.open_license_status, bg="#201a10", fg="#fbbf24", activebackground="#352511", activeforeground="#fbbf24", relief="flat", bd=0, padx=14, pady=8, font=("Microsoft YaHei UI", 10, "bold")).pack(side=LEFT, padx=(18, 12))
+        Label(top, text="👤  极影用户⌄", bg="#0f1625", fg="#cbd5e1", font=("Microsoft YaHei UI", 11)).pack(side=LEFT, padx=(0, 20))
+        Button(top, text="⚙ 工作流设置", command=self.open_ai_settings, bg=COLOR_PANEL_2, fg="#dbe7f7", activebackground="#233047", activeforeground="#ffffff", relief="flat", bd=0, padx=14, pady=8).pack(side=LEFT, padx=(0, 10))
+        Button(top, text="▣ 停止流程", command=lambda: self.status_var.set("流程已暂停"), bg=COLOR_PANEL_2, fg="#fb7185", activebackground="#2a1f2b", activeforeground="#fb7185", relief="flat", bd=0, padx=14, pady=8).pack(side=LEFT)
 
-        shell = Frame(self.root, padx=14, bg=COLOR_BG)
-        shell.pack(fill=BOTH, expand=True, pady=(0, 8))
+        shell = Frame(self.root, padx=0, pady=0, bg=COLOR_BG)
+        shell.pack(fill=BOTH, expand=True)
 
-        nav = Frame(shell, width=190, padx=10, pady=14, bg=COLOR_NAV, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        nav = Frame(shell, width=285, padx=18, pady=24, bg=COLOR_NAV, highlightthickness=1, highlightbackground=COLOR_BORDER)
         nav.pack(side=LEFT, fill=Y)
         nav.pack_propagate(False)
-        Label(nav, text=APP_NAME, font=("Microsoft YaHei UI", 18, "bold"), anchor="w", bg=COLOR_NAV, fg=COLOR_TEXT).pack(fill=X)
-        Label(nav, text="解析 / 改写 / 生图 / 视频", font=FONT_SMALL, anchor="w", bg=COLOR_NAV, fg=COLOR_MUTED).pack(fill=X, pady=(2, 18))
+        brand_row = Frame(nav, bg=COLOR_NAV)
+        brand_row.pack(fill=X, pady=(0, 28))
+        Label(brand_row, text="▶", bg=COLOR_NAV, fg="#8b5cf6", font=("Microsoft YaHei UI", 28, "bold")).pack(side=LEFT)
+        Label(brand_row, text=APP_NAME, bg=COLOR_NAV, fg=COLOR_TEXT, font=("Microsoft YaHei UI", 20, "bold")).pack(side=LEFT, padx=(8, 8))
+        Label(brand_row, text="AI", bg="#4f46e5", fg="#ffffff", font=("Microsoft YaHei UI", 9, "bold"), padx=5, pady=1).pack(side=LEFT, pady=(6, 0))
 
         self.nav_buttons = {}
+        self.nav_icons = {
+            "agent": "✚",
+            "parser": "▣",
+            "rewrite": "◉",
+            "image": "▧",
+            "generate": "▤",
+            "assets": "▰",
+            "tasks": "☰",
+        }
         for key, text in (
             ("agent", "Agent 对话"),
             ("parser", "视频解析"),
@@ -2099,24 +2115,35 @@ class GrokVideoStudio:
         ):
             button = Button(
                 nav,
-                text=text,
+                text=f"{self.nav_icons.get(key, '•')}  {text}",
                 anchor="w",
                 command=lambda name=key: self.show_section(name),
                 bg=COLOR_NAV,
-                fg=COLOR_MUTED,
-                activebackground=COLOR_PANEL_2,
-                activeforeground=COLOR_TEXT,
+                fg="#b8c4d9",
+                activebackground="#1f2a44",
+                activeforeground="#ffffff",
                 relief="flat",
                 bd=0,
-                padx=14,
-                pady=10,
-                font=FONT_BODY,
+                padx=18,
+                pady=13,
+                font=("Microsoft YaHei UI", 13, "bold"),
             )
             button.pack(fill=X, pady=4)
             self.nav_buttons[key] = button
 
+        nav_spacer = Frame(nav, bg=COLOR_NAV)
+        nav_spacer.pack(fill=BOTH, expand=True)
+        gpu_card = Frame(nav, bg="#182235", padx=16, pady=14, highlightthickness=1, highlightbackground="#2b3a52")
+        gpu_card.pack(fill=X, pady=(12, 18))
+        Label(gpu_card, text="●  本地加速已就绪", bg="#182235", fg="#34d399", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        Label(gpu_card, text="可在设置中切换本地模型与外部工具", bg="#182235", fg="#94a3b8", font=("Microsoft YaHei UI", 10), wraplength=210, justify="left").pack(anchor="w", pady=(10, 0))
+        footer = Frame(nav, bg=COLOR_NAV)
+        footer.pack(fill=X)
+        Label(footer, text="极影AI 版本 1.2.0", bg=COLOR_NAV, fg="#8da2bf", font=FONT_SMALL).pack(side=LEFT)
+        Label(footer, text="● 检查更新", bg=COLOR_NAV, fg="#34d399", font=FONT_SMALL).pack(side=RIGHT)
+
         self.workspace = Frame(shell, bg=COLOR_BG)
-        self.workspace.pack(side=RIGHT, fill=BOTH, expand=True, padx=(10, 0))
+        self.workspace.pack(side=RIGHT, fill=BOTH, expand=True, padx=(18, 20), pady=(18, 12))
 
         self.parser_tab = Frame(self.workspace, padx=8, pady=8)
         self.agent_tab = Frame(self.workspace, padx=8, pady=8)
@@ -2144,8 +2171,8 @@ class GrokVideoStudio:
         self.build_tasks_tab(self.tasks_tab)
         self.show_section("parser")
 
-        log_box = LabelFrame(self.root, text="运行日志", padx=10, pady=8, bg=COLOR_PANEL, fg=COLOR_MUTED)
-        log_box.pack(fill=X, padx=14, pady=(0, 12))
+        log_box = LabelFrame(self.root, text="运行日志 / 系统事件", padx=12, pady=8, bg=COLOR_PANEL, fg=COLOR_MUTED, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        log_box.pack(fill=X, padx=20, pady=(0, 14))
         self.log_text = Text(log_box, height=4, wrap="word")
         self.log_text.pack(fill=X)
         self.apply_dark_theme(self.root)
@@ -2159,9 +2186,9 @@ class GrokVideoStudio:
         frame.pack(fill=BOTH, expand=True)
         for key, button in self.nav_buttons.items():
             if key == name:
-                button.configure(bg=COLOR_ACCENT_DARK, fg="#ffffff", relief="flat")
+                button.configure(bg=COLOR_ACCENT_DARK, fg="#ffffff", activebackground="#6d3df4", activeforeground="#ffffff", relief="flat")
             else:
-                button.configure(bg=COLOR_NAV, fg=COLOR_MUTED, relief="flat")
+                button.configure(bg=COLOR_NAV, fg="#b8c4d9", activebackground="#1f2a44", activeforeground="#ffffff", relief="flat")
         section_names = {
             "agent": "Agent 对话",
             "parser": "视频解析",
